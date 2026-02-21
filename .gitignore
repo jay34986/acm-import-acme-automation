@@ -149,3 +149,6 @@ lambda/renew_certificate/vendor/
 
 # CDK asset staging
 .cdk.staging/
+
+# Dev Container
+.devcontainer

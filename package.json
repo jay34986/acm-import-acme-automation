@@ -1,0 +1,24 @@
+{
+  "name": "acm-import-acme-automation",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "cdk": "cdk",
+    "lint": "eslint 'bin/**/*.ts' 'lib/**/*.ts' --max-warnings 0",
+    "test": "jest"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "cdk-nag": "^2.34.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "aws-cdk": "^2.170.0",
+    "eslint": "^8.57.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.7.0"
+  }
+}

@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Optional
 
 import boto3
@@ -47,10 +46,6 @@ AWS_REGION: str = os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-1")
 # ACME RSA key size for account and certificate keys
 ACCOUNT_KEY_BITS = 2048
 CERT_KEY_BITS = 2048
-
-# Polling configuration
-CHALLENGE_POLL_INTERVAL = 5   # seconds between status polls
-CHALLENGE_POLL_MAX = 60       # max number of polls (~5 minutes)
 
 # ---------------------------------------------------------------------------
 # AWS clients (module-level for Lambda container reuse)
@@ -107,7 +102,7 @@ def _generate_cert_key() -> rsa.RSAPrivateKey:
 
 
 def _generate_csr(domain: str, private_key: rsa.RSAPrivateKey) -> bytes:
-    """Return a DER-encoded CSR for *domain*."""
+    """Return a PEM-encoded CSR for *domain*."""
     csr = (
         x509.CertificateSigningRequestBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
@@ -117,7 +112,7 @@ def _generate_csr(domain: str, private_key: rsa.RSAPrivateKey) -> bytes:
         )
         .sign(private_key, hashes.SHA256(), default_backend())
     )
-    return csr.public_bytes(serialization.Encoding.DER)
+    return csr.public_bytes(serialization.Encoding.PEM)
 
 
 def _register_or_find_account(acme_client: client.ClientV2) -> None:
@@ -202,7 +197,23 @@ def _import_to_acm(
 # ---------------------------------------------------------------------------
 
 def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
-    """Entry point for the certificate renewal Lambda."""
+    """Renew a TLS certificate via ACME and import it to ACM.
+
+    Parameters
+    ----------
+    event:
+        Lambda event payload (not used; the function is triggered manually or
+        on a schedule without meaningful input).
+    context:
+        Lambda runtime context (not used).
+
+    Returns
+    -------
+    dict
+        A dict with ``statusCode`` (200 on success, 500 on failure) and a
+        JSON-encoded ``body`` containing ``message``, ``domain``, and
+        ``certificateArn`` (on success) or ``error`` (on failure).
+    """
     logger.info("Starting certificate renewal for domain: %s", DOMAIN)
 
     try:
@@ -254,23 +265,9 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
                 acme_client.answer_challenge(http01_chall, http01_chall.chall.response(account_key))
                 logger.info("Challenge answered for %s", domain_name)
 
-            # 7. Poll for order completion
-            logger.info("Polling for order finalisation…")
-            for attempt in range(CHALLENGE_POLL_MAX):
-                order = acme_client.poll_order_and_request_issuance(
-                    jose.util.ComparableX509(
-                        x509.load_der_x509_csr(csr_der, default_backend())  # type: ignore[arg-type]
-                    ),
-                    order.authorizations,
-                )
-                if order.body.status == messages.STATUS_VALID:
-                    break
-                if order.body.status == messages.STATUS_INVALID:
-                    raise RuntimeError("ACME order failed (status=invalid)")
-                logger.info("Order status: %s (attempt %d/%d)", order.body.status, attempt + 1, CHALLENGE_POLL_MAX)
-                time.sleep(CHALLENGE_POLL_INTERVAL)
-            else:
-                raise TimeoutError("ACME order did not complete within the allowed time")
+            # 7. Finalise the order: poll authorisations then submit the CSR
+            logger.info("Finalising ACME order…")
+            order = acme_client.poll_and_finalize(order)
 
         finally:
             # Always clean up challenge tokens

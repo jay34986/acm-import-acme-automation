@@ -13,6 +13,15 @@ export class AcmImportAcmeStack extends cdk.Stack {
     super(scope, id, props);
 
     // -------------------------------------------------------------------------
+    // Stack Parameter: target domain / IP address for the certificate
+    // -------------------------------------------------------------------------
+    const domainParam = new cdk.CfnParameter(this, 'Domain', {
+      type: 'String',
+      description: 'Domain name or IP address to issue the TLS certificate for (e.g. 203.0.113.1)',
+      default: 'example.com',
+    });
+
+    // -------------------------------------------------------------------------
     // VPC: single AZ, public subnet only (no NAT GW to save cost)
     // -------------------------------------------------------------------------
     const vpc = new ec2.Vpc(this, 'Vpc', {
@@ -169,7 +178,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
         ACME_ACCOUNT_SECRET_ARN: acmeAccountSecret.secretArn,
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,
-        DOMAIN: 'example.com', // Replace with your actual domain or IP address before deploying
+        DOMAIN: domainParam.valueAsString,
         AWS_DEFAULT_REGION: 'ap-northeast-1',
       },
     });

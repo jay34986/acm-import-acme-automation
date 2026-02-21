@@ -1,5 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -19,6 +20,25 @@ export class AcmImportAcmeStack extends cdk.Stack {
       type: 'String',
       description: 'Domain name or IP address to issue the TLS certificate for (e.g. 203.0.113.1)',
       default: 'example.com',
+    });
+
+    // -------------------------------------------------------------------------
+    // Stack Parameter: ACM certificate ARN for the NLB TLS listener
+    // -------------------------------------------------------------------------
+    const certArnParam = new cdk.CfnParameter(this, 'CertificateArn', {
+      type: 'String',
+      description:
+        'ACM certificate ARN to attach to the NLB TLS listener (port 443). ' +
+        'Leave empty on initial deploy; run RenewCertLambda first to obtain the certificate, ' +
+        'then redeploy with this value.',
+      default: '',
+    });
+
+    // Condition: only create the TLS listener when a certificate ARN is provided
+    const hasCert = new cdk.CfnCondition(this, 'HasCertificate', {
+      expression: cdk.Fn.conditionNot(
+        cdk.Fn.conditionEquals(certArnParam.valueAsString, ''),
+      ),
     });
 
     // -------------------------------------------------------------------------
@@ -179,6 +199,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,
         DOMAIN: domainParam.valueAsString,
+        CERTIFICATE_ARN: certArnParam.valueAsString,
         AWS_DEFAULT_REGION: 'ap-northeast-1',
       },
     });
@@ -202,27 +223,20 @@ export class AcmImportAcmeStack extends cdk.Stack {
     );
 
     // -------------------------------------------------------------------------
-    // Security Group for EC2
+    // Security Group for EC2 (HTTP from VPC only; TLS is terminated at the NLB)
     // -------------------------------------------------------------------------
     const webServerSg = new ec2.SecurityGroup(this, 'WebServerSg', {
       vpc,
-      description: 'Security group for the ACME web server',
+      description: 'Security group for the ACME web server (HTTP from VPC only; TLS terminated at NLB)',
       allowAllOutbound: true,
     });
 
-    webServerSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP from anywhere');
-    webServerSg.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(80), 'Allow HTTP from anywhere (IPv6)');
-    webServerSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'Allow HTTPS from anywhere');
-    webServerSg.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(443), 'Allow HTTPS from anywhere (IPv6)');
-    // SSH is intentionally disabled in production; uncomment and restrict to your IP if needed:
-    // webServerSg.addIngressRule(ec2.Peer.ipv4('YOUR.IP.HERE/32'), ec2.Port.tcp(22), 'Allow SSH from admin IP');
-
-    NagSuppressions.addResourceSuppressions(webServerSg, [
-      {
-        id: 'AwsSolutions-EC23',
-        reason: 'Port 80 and 443 must be open to the internet for a public web server; SSH (22) is not open',
-      },
-    ]);
+    // Allow HTTP from within the VPC (NLB-to-EC2 traffic and NLB health checks)
+    webServerSg.addIngressRule(
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(80),
+      'Allow HTTP from VPC (NLB to EC2)',
+    );
 
     // -------------------------------------------------------------------------
     // IAM Role for EC2
@@ -234,12 +248,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
       ],
     });
-
-    ec2Role.addToPolicy(new iam.PolicyStatement({
-      sid: 'ReadCertSecret',
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [certSecret.secretArn],
-    }));
 
     ec2Role.addToPolicy(new iam.PolicyStatement({
       sid: 'ReadChallengeBucket',
@@ -263,7 +271,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     });
 
     // -------------------------------------------------------------------------
-    // EC2 User Data
+    // EC2 User Data (nginx serves plain HTTP; TLS is terminated at the NLB)
     // -------------------------------------------------------------------------
     const userData = ec2.UserData.forLinux();
     userData.addCommands(
@@ -273,15 +281,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
       // Install nginx
       'dnf update -y',
       'dnf install -y nginx',
-
-      // Create SSL directory
-      'mkdir -p /etc/nginx/ssl',
-
-      // Write a self-signed placeholder cert so nginx can start before the real cert is loaded
-      'openssl req -x509 -nodes -days 1 -newkey rsa:2048 \\',
-      '  -keyout /etc/nginx/ssl/server.key \\',
-      '  -out /etc/nginx/ssl/server.crt \\',
-      '  -subj "/CN=placeholder"',
 
       // Write nginx config
       'cat > /etc/nginx/conf.d/acme.conf << \'NGINXEOF\'',
@@ -295,21 +294,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
       '        proxy_set_header Host s3.ap-northeast-1.amazonaws.com;',
       '        proxy_ssl_verify on;',
       '    }',
-      '',
-      '    # Redirect all other HTTP to HTTPS',
-      '    location / {',
-      '        return 301 https://$host$request_uri;',
-      '    }',
-      '}',
-      '',
-      'server {',
-      '    listen 443 ssl;',
-      '    server_name _;',
-      '',
-      '    ssl_certificate     /etc/nginx/ssl/server.crt;',
-      '    ssl_certificate_key /etc/nginx/ssl/server.key;',
-      '    ssl_protocols       TLSv1.2 TLSv1.3;',
-      '    ssl_ciphers         HIGH:!aNULL:!MD5;',
       '',
       '    location / {',
       '        root   /usr/share/nginx/html;',
@@ -367,19 +351,90 @@ export class AcmImportAcmeStack extends cdk.Stack {
     ]);
 
     // -------------------------------------------------------------------------
-    // Elastic IP associated with EC2
+    // Elastic IP for the NLB (static IP used as the subject for the certificate)
     // -------------------------------------------------------------------------
-    const eip = new ec2.CfnEIP(this, 'WebServerEip', {
+    const nlbEip = new ec2.CfnEIP(this, 'NlbEip', {
       domain: 'vpc',
-      instanceId: instance.instanceId,
     });
+
+    // -------------------------------------------------------------------------
+    // Network Load Balancer (TLS terminated here; forwards plain HTTP to EC2)
+    // Use CfnLoadBalancer (L1) to assign the EIP via SubnetMappings.
+    // -------------------------------------------------------------------------
+    const cfnNlb = new elbv2.CfnLoadBalancer(this, 'Nlb', {
+      type: 'network',
+      scheme: 'internet-facing',
+      subnetMappings: [{
+        subnetId: vpc.publicSubnets[0].subnetId,
+        allocationId: nlbEip.attrAllocationId,
+      }],
+      loadBalancerAttributes: [
+        { key: 'load_balancing.cross_zone.enabled', value: 'false' },
+        { key: 'access_logs.s3.enabled', value: 'false' },
+      ],
+    });
+
+    NagSuppressions.addResourceSuppressions(cfnNlb, [
+      {
+        id: 'AwsSolutions-ELB2',
+        reason: 'NLB access logs are disabled to minimise cost for this validation environment',
+      },
+    ]);
+
+    // -------------------------------------------------------------------------
+    // NLB Target Group: EC2 on port 80
+    // -------------------------------------------------------------------------
+    const cfnTargetGroup = new elbv2.CfnTargetGroup(this, 'WebTargetGroup', {
+      vpcId: vpc.vpcId,
+      protocol: 'TCP',
+      port: 80,
+      targetType: 'instance',
+      targets: [{ id: instance.instanceId }],
+      healthCheckProtocol: 'HTTP',
+      healthCheckPath: '/',
+      healthCheckPort: '80',
+    });
+
+    // -------------------------------------------------------------------------
+    // NLB Listener: TCP port 80 (ACME HTTP-01 challenge pass-through)
+    // -------------------------------------------------------------------------
+    new elbv2.CfnListener(this, 'HttpListener', {
+      loadBalancerArn: cfnNlb.ref,
+      protocol: 'TCP',
+      port: 80,
+      defaultActions: [{
+        type: 'forward',
+        targetGroupArn: cfnTargetGroup.ref,
+      }],
+    });
+
+    // -------------------------------------------------------------------------
+    // NLB Listener: TLS port 443 (created only when CertificateArn is provided)
+    // -------------------------------------------------------------------------
+    const cfnTlsListener = new elbv2.CfnListener(this, 'TlsListener', {
+      loadBalancerArn: cfnNlb.ref,
+      protocol: 'TLS',
+      port: 443,
+      sslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
+      certificates: [{ certificateArn: certArnParam.valueAsString }],
+      defaultActions: [{
+        type: 'forward',
+        targetGroupArn: cfnTargetGroup.ref,
+      }],
+    });
+    cfnTlsListener.cfnOptions.condition = hasCert;
 
     // -------------------------------------------------------------------------
     // Stack Outputs
     // -------------------------------------------------------------------------
-    new cdk.CfnOutput(this, 'WebServerPublicIp', {
-      value: eip.ref,
-      description: 'Elastic IP address of the web server',
+    new cdk.CfnOutput(this, 'NlbPublicIp', {
+      value: nlbEip.ref,
+      description: 'Static Elastic IP address of the Network Load Balancer',
+    });
+
+    new cdk.CfnOutput(this, 'NlbDnsName', {
+      value: cfnNlb.attrDnsName,
+      description: 'DNS name of the Network Load Balancer',
     });
 
     new cdk.CfnOutput(this, 'ChallengeBucketName', {

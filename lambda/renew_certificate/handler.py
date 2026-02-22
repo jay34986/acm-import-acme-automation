@@ -14,6 +14,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -152,16 +153,39 @@ def _generate_cert_key() -> rsa.RSAPrivateKey:
 
 def _generate_csr(domain: str, private_key: rsa.RSAPrivateKey) -> bytes:
     """Return a PEM-encoded CSR for *domain*."""
+    san_name: x509.GeneralName
+    subject_name: x509.Name
+    try:
+        parsed_ip = ipaddress.ip_address(domain)
+        san_name = x509.IPAddress(parsed_ip)
+        subject_name = x509.Name([])
+    except ValueError:
+        san_name = x509.DNSName(domain)
+        subject_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)])
+
     csr = (
         x509.CertificateSigningRequestBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
+        .subject_name(subject_name)
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(domain)]),
+            x509.SubjectAlternativeName([san_name]),
             critical=False,
         )
         .sign(private_key, hashes.SHA256(), default_backend())
     )
     return csr.public_bytes(serialization.Encoding.PEM)
+
+
+def _resolve_acme_profile(identifier: str) -> str | None:
+    """Resolve ACME profile based on identifier type.
+
+    Let's Encrypt の IP 証明書は shortlived プロファイル必須。
+    DNS は既存互換のためデフォルトプロファイル(None)を利用する。
+    """
+    try:
+        ipaddress.ip_address(identifier)
+        return "shortlived"
+    except ValueError:
+        return None
 
 
 def _register_or_find_account(acme_client: client.ClientV2) -> None:
@@ -172,8 +196,29 @@ def _register_or_find_account(acme_client: client.ClientV2) -> None:
         )
         acme_client.new_account(reg)
         logger.info("Registered new ACME account")
-    except errors.ConflictError:
-        logger.info("ACME account already exists")
+    except errors.ConflictError as exc:
+        account_url = exc.location if isinstance(exc.location, str) else ""
+
+        if account_url == "" or account_url == "UNKNOWN-LOCATION":
+            existing_only = messages.NewRegistration.from_data(
+                email=None,
+                terms_of_service_agreed=True,
+                only_return_existing=True,
+            )
+            acme_client.new_account(existing_only)
+            logger.info(
+                "ACME account already exists (resolved via only_return_existing)"
+            )
+            return
+
+        existing_registration = messages.RegistrationResource(
+            body=messages.Registration.from_data(),
+            uri=account_url,
+            new_authzr_uri=None,
+            terms_of_service=None,
+        )
+        acme_client.query_registration(existing_registration)
+        logger.info("ACME account already exists: %s", account_url)
 
 
 def _upload_challenge_token(token_path: str, key_authorisation: str) -> None:
@@ -286,8 +331,15 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
         net = client.ClientNetwork(
             account_key, user_agent="acm-import-acme-automation/1.0"
         )
-        directory = messages.Directory.from_json(net.get(ACME_DIRECTORY_URL).json())
+        directory_json = net.get(ACME_DIRECTORY_URL).json()
+        directory = messages.Directory.from_json(directory_json)
         acme_client = client.ClientV2(directory, net)
+
+        acme_profile = _resolve_acme_profile(DOMAIN)
+        if acme_profile is not None:
+            logger.info(
+                "Using ACME profile '%s' for identifier '%s'", acme_profile, DOMAIN
+            )
 
         # 3. Register / find ACME account
         _register_or_find_account(acme_client)
@@ -297,7 +349,7 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
         csr_pem = _generate_csr(DOMAIN, cert_private_key)
 
         # 5. Create a new certificate order
-        order = acme_client.new_order(csr_pem)
+        order = acme_client.new_order(csr_pem, profile=acme_profile)
         logger.info("Created ACME order: %s", order.uri)
 
         # 6. Handle HTTP-01 challenges
@@ -316,7 +368,10 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
                 if http01_chall is None:
                     raise RuntimeError(f"No HTTP-01 challenge found for {domain_name}")
 
-                token_path = http01_chall.chall.encode_token()
+                if hasattr(http01_chall.chall, "encode"):
+                    token_path = http01_chall.chall.encode("token")
+                else:
+                    token_path = http01_chall.chall.encode_token()
                 key_auth = http01_chall.chall.key_authorization(account_key)
                 _upload_challenge_token(token_path, key_auth)
                 challenge_resources.append(token_path)

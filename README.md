@@ -108,6 +108,9 @@ Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタック定義から�
 | `DOMAIN` | CDKが自動設定 (`NlbPublicIp`) | 証明書を発行するIPアドレス (NLBに割り当てたEIP) |
 | `CERTIFICATE_ARN` | `--parameters CertificateArn=` で設定 | 既存のACM証明書ARN (空の場合は新規インポート、指定した場合は上書き更新) |
 
+`DOMAIN` がIPアドレスの場合、Lambdaは ACME の `shortlived` プロファイルを自動選択します。
+Let's Encrypt のIP証明書は短期証明書プロファイルが必須のためです（有効期間は約6日）。
+
 > `AWS_DEFAULT_REGION` は Lambda ランタイム予約済みのため、CDKで手動設定していません。ランタイムが自動で設定します。
 
 ### ステージング環境でのテスト
@@ -123,6 +126,27 @@ aws lambda update-function-configuration \
 ```
 
 > ステージング証明書はブラウザに信頼されません。動作確認後は本番URLに戻してください。
+
+---
+
+## 実装メモ（IP証明書対応）
+
+IP証明書対応時にハマりやすい点を、記録としてまとめます。
+
+- **Let's Encryptエンドポイントの扱い**
+  - 利用するACMEディレクトリURLは `https://acme-v02.api.letsencrypt.org/directory`（本番）
+  - ステージングは `https://acme-staging-v02.api.letsencrypt.org/directory`
+  - プロファイル情報はディレクトリオブジェクトのトップレベルではなく `meta.profiles` 側にある
+
+- **`acme` ライブラリのバージョンアップが必要だった理由**
+  - `acme==2.11.0` では `ClientV2.new_order()` に `profile` 引数がなく、IP証明書必須の `shortlived` を指定できない
+  - そのため `acme==5.3.1` に更新（合わせて `josepy>=2.0.0` / `cryptography>=43.0.0` へ更新）
+
+- **上記以外に残しておくべきポイント**
+  - `acme` 5系では例外・チャレンジAPIが一部変わっている（`ConflictError.location`、HTTP-01トークン取得）
+  - IP証明書のCSRは `SAN=iPAddress` で作成し、IPを `Common Name` に入れない実装にしている
+  - 現在の主な失敗要因はコードではなく HTTP-01 到達性（`Timeout during connect`）で、NLB:80 到達・nginx応答・経路制御の確認が必要
+  - IP証明書は短期（約6日）なので、検証後は手動運用ではなく自動実行方式（EventBridgeなど）への移行を前提にする
 
 ---
 

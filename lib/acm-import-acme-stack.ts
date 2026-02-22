@@ -17,15 +17,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
     const vpcCidr = '10.0.0.0/16';
 
     // -------------------------------------------------------------------------
-    // Stack Parameter: target domain / IP address for the certificate
-    // -------------------------------------------------------------------------
-    const domainParam = new cdk.CfnParameter(this, 'Domain', {
-      type: 'String',
-      description: 'Domain name or IP address to issue the TLS certificate for (e.g. 203.0.113.1)',
-      default: 'example.com',
-    });
-
-    // -------------------------------------------------------------------------
     // Stack Parameter: ACM certificate ARN for the NLB TLS listener
     // -------------------------------------------------------------------------
     const certArnParam = new cdk.CfnParameter(this, 'CertificateArn', {
@@ -72,6 +63,13 @@ export class AcmImportAcmeStack extends cdk.Stack {
         reason: 'VPC flow logs are enabled; cost-optimised single-AZ public-only VPC for a small web server',
       },
     ]);
+
+    // -------------------------------------------------------------------------
+    // Elastic IP for the NLB (static IP used as the certificate subject)
+    // -------------------------------------------------------------------------
+    const nlbEip = new ec2.CfnEIP(this, 'NlbEip', {
+      domain: 'vpc',
+    });
 
     // -------------------------------------------------------------------------
     // S3 Bucket: ACME HTTP-01 challenge tokens
@@ -216,7 +214,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
         ACME_ACCOUNT_SECRET_ARN: acmeAccountSecret.secretArn,
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,
-        DOMAIN: domainParam.valueAsString,
+        DOMAIN: nlbEip.ref,
         CERTIFICATE_ARN: certArnParam.valueAsString,
       },
     });
@@ -366,13 +364,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
         reason: 'Auto Scaling is intentionally not used; this is a single-instance cost-optimised web server',
       },
     ]);
-
-    // -------------------------------------------------------------------------
-    // Elastic IP for the NLB (static IP used as the subject for the certificate)
-    // -------------------------------------------------------------------------
-    const nlbEip = new ec2.CfnEIP(this, 'NlbEip', {
-      domain: 'vpc',
-    });
 
     // -------------------------------------------------------------------------
     // Network Load Balancer (TLS terminated here; forwards plain HTTP to EC2)

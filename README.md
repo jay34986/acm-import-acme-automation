@@ -47,11 +47,9 @@ npm run build
 ### 第1回デプロイ — インフラ構築 & 証明書取得
 
 このデプロイでは NLB (TCP:80 リスナーのみ) と EC2 などのインフラを構築します。  
-`Domain` パラメータには、NLBのEIPに割り当てるIPアドレスまたはドメイン名を指定してください。
 
 ```bash
-cdk deploy \
-  --parameters Domain=<EIPのIPアドレスまたはドメイン名>
+cdk deploy
 ```
 
 > **ヒント**: デプロイ完了後、出力の `NlbPublicIp` に表示される静的IPアドレスが証明書のサブジェクトになります。
@@ -87,7 +85,6 @@ cat response.json
 
 ```bash
 cdk deploy \
-  --parameters Domain=<EIPのIPアドレスまたはドメイン名> \
   --parameters CertificateArn=<第1回デプロイで取得したACM証明書ARN>
 ```
 
@@ -95,7 +92,7 @@ cdk deploy \
 
 ## Lambdaの環境変数
 
-Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタックのパラメータから自動的に設定されます。  
+Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタック定義から自動的に設定されます。  
 手動で変更する場合は AWS マネジメントコンソールの Lambda 設定画面、または AWS CLI で更新してください。
 
 | 環境変数 | 設定方法 | 説明 |
@@ -104,7 +101,7 @@ Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタックのパラメ�
 | `ACME_ACCOUNT_SECRET_ARN` | CDKが自動設定 | ACMEアカウント秘密鍵を保管する Secrets Manager シークレットの ARN |
 | `CERT_SECRET_ARN` | CDKが自動設定 | 発行された証明書データ (cert / key / chain) を保管する Secrets Manager シークレットの ARN |
 | `CHALLENGE_BUCKET` | CDKが自動設定 | ACME HTTP-01 チャレンジトークンを配置する S3 バケット名 |
-| `DOMAIN` | `--parameters Domain=` で設定 | 証明書を発行するIPアドレスまたはドメイン名 |
+| `DOMAIN` | CDKが自動設定 (`NlbPublicIp`) | 証明書を発行するIPアドレス (NLBに割り当てたEIP) |
 | `CERTIFICATE_ARN` | `--parameters CertificateArn=` で設定 | 既存のACM証明書ARN (空の場合は新規インポート、指定した場合は上書き更新) |
 
 > `AWS_DEFAULT_REGION` は Lambda ランタイム予約済みのため、CDKで手動設定していません。ランタイムが自動で設定します。

@@ -13,6 +13,9 @@ export class AcmImportAcmeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
+    const deploymentRegion = cdk.Stack.of(this).region;
+    const vpcCidr = '10.0.0.0/16';
+
     // -------------------------------------------------------------------------
     // Stack Parameter: target domain / IP address for the certificate
     // -------------------------------------------------------------------------
@@ -45,6 +48,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // VPC: single AZ, public subnet only (no NAT GW to save cost)
     // -------------------------------------------------------------------------
     const vpc = new ec2.Vpc(this, 'Vpc', {
+      ipAddresses: ec2.IpAddresses.cidr(vpcCidr),
       maxAzs: 1,
       natGateways: 0,
       subnetConfiguration: [
@@ -116,6 +120,13 @@ export class AcmImportAcmeStack extends cdk.Stack {
       },
     });
 
+    NagSuppressions.addResourceSuppressions(acmeAccountSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason: 'This secret stores an ACME account key and is updated by application workflow, not by native Secrets Manager rotation integration',
+      },
+    ]);
+
     // -------------------------------------------------------------------------
     // Secrets Manager: TLS certificate data (cert + key + chain)
     // -------------------------------------------------------------------------
@@ -126,6 +137,13 @@ export class AcmImportAcmeStack extends cdk.Stack {
         generateStringKey: '_unused',
       },
     });
+
+    NagSuppressions.addResourceSuppressions(certSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason: 'This secret stores certificate artifacts that are rotated by the ACME renewal Lambda, not by native Secrets Manager rotation',
+      },
+    ]);
 
     // -------------------------------------------------------------------------
     // IAM Role for Lambda
@@ -200,7 +218,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
         CHALLENGE_BUCKET: challengeBucket.bucketName,
         DOMAIN: domainParam.valueAsString,
         CERTIFICATE_ARN: certArnParam.valueAsString,
-        AWS_DEFAULT_REGION: 'ap-northeast-1',
       },
     });
 
@@ -233,7 +250,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
 
     // Allow HTTP from within the VPC (NLB-to-EC2 traffic and NLB health checks)
     webServerSg.addIngressRule(
-      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Peer.ipv4(vpcCidr),
       ec2.Port.tcp(80),
       'Allow HTTP from VPC (NLB to EC2)',
     );
@@ -290,8 +307,8 @@ export class AcmImportAcmeStack extends cdk.Stack {
       '',
       '    # Proxy ACME HTTP-01 challenge tokens to S3',
       '    location /.well-known/acme-challenge/ {',
-      '        proxy_pass https://s3.ap-northeast-1.amazonaws.com/${CHALLENGE_BUCKET}/.well-known/acme-challenge/;',
-      '        proxy_set_header Host s3.ap-northeast-1.amazonaws.com;',
+      `        proxy_pass https://s3.${deploymentRegion}.amazonaws.com/\${CHALLENGE_BUCKET}/.well-known/acme-challenge/;`,
+      `        proxy_set_header Host s3.${deploymentRegion}.amazonaws.com;`,
       '        proxy_ssl_verify on;',
       '    }',
       '',

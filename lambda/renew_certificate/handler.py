@@ -17,12 +17,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
+from collections.abc import Mapping
+from typing import Final, Protocol, cast
 
 import boto3
-from botocore.exceptions import ClientError
 import josepy as jose
 from acme import challenges, client, errors, messages
+from botocore.exceptions import ClientError
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
@@ -32,6 +33,39 @@ from cryptography.x509.oid import NameOID
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+class SecretsManagerClient(Protocol):
+    def get_secret_value(self, *, SecretId: str) -> Mapping[str, object]: ...
+
+    def put_secret_value(
+        self, *, SecretId: str, SecretString: str
+    ) -> Mapping[str, object]: ...
+
+
+class S3Client(Protocol):
+    def put_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Body: bytes,
+        ContentType: str,
+    ) -> Mapping[str, object]: ...
+
+    def delete_object(self, *, Bucket: str, Key: str) -> Mapping[str, object]: ...
+
+
+class AcmClient(Protocol):
+    def import_certificate(
+        self,
+        *,
+        Certificate: bytes,
+        PrivateKey: bytes,
+        CertificateChain: bytes,
+        CertificateArn: str | None = None,
+    ) -> Mapping[str, object]: ...
+
+
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
@@ -40,30 +74,45 @@ ACME_ACCOUNT_SECRET_ARN: str = os.environ["ACME_ACCOUNT_SECRET_ARN"]
 CERT_SECRET_ARN: str = os.environ["CERT_SECRET_ARN"]
 CHALLENGE_BUCKET: str = os.environ["CHALLENGE_BUCKET"]
 DOMAIN: str = os.environ["DOMAIN"]
-CERTIFICATE_ARN: Optional[str] = os.environ.get("CERTIFICATE_ARN")
+CERTIFICATE_ARN: str | None = os.environ.get("CERTIFICATE_ARN")
 AWS_REGION: str = os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-1")
 
 # ACME RSA key size for account and certificate keys
-ACCOUNT_KEY_BITS = 2048
-CERT_KEY_BITS = 2048
+ACCOUNT_KEY_BITS: Final[int] = 2048
+CERT_KEY_BITS: Final[int] = 2048
 
 # ---------------------------------------------------------------------------
 # AWS clients (module-level for Lambda container reuse)
 # ---------------------------------------------------------------------------
-sm_client = boto3.client("secretsmanager", region_name=AWS_REGION)
-s3_client = boto3.client("s3", region_name=AWS_REGION)
-acm_client = boto3.client("acm", region_name=AWS_REGION)
+sm_client: SecretsManagerClient = cast(
+    SecretsManagerClient,
+    boto3.client("secretsmanager", region_name=AWS_REGION),
+)
+s3_client: S3Client = cast(S3Client, boto3.client("s3", region_name=AWS_REGION))
+acm_client: AcmClient = cast(AcmClient, boto3.client("acm", region_name=AWS_REGION))
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_or_create_account_key() -> jose.JWKRSA:
     """Load the ACME account RSA key from Secrets Manager, creating it on first run."""
     secret = sm_client.get_secret_value(SecretId=ACME_ACCOUNT_SECRET_ARN)
-    data: dict = json.loads(secret["SecretString"])
-    pem: str = data.get("key", "")
+    secret_string = secret.get("SecretString")
+    if not isinstance(secret_string, str):
+        raise RuntimeError("SecretString is missing or invalid for ACME account secret")
+
+    parsed_data = json.loads(secret_string)
+    if not isinstance(parsed_data, dict):
+        raise RuntimeError("ACME account secret payload must be a JSON object")
+    data: dict[str, object] = dict(parsed_data)
+
+    pem_value = data.get("key", "")
+    if not isinstance(pem_value, str):
+        raise RuntimeError("The 'key' field in ACME account secret must be a string")
+    pem = pem_value
 
     if pem:
         logger.info("Loaded existing ACME account key from Secrets Manager")
@@ -175,19 +224,31 @@ def _import_to_acm(
     chain_pem: str,
 ) -> str:
     """Import (or re-import) the certificate into ACM. Returns the certificate ARN."""
-    kwargs: dict = {
-        "Certificate": certificate_pem.encode(),
-        "PrivateKey": private_key_pem.encode(),
-        "CertificateChain": chain_pem.encode(),
-    }
-    if CERTIFICATE_ARN:
-        kwargs["CertificateArn"] = CERTIFICATE_ARN
-        logger.info("Re-importing certificate to ACM: %s", CERTIFICATE_ARN)
+    certificate_arn = CERTIFICATE_ARN
+    certificate_bytes = certificate_pem.encode()
+    private_key_bytes = private_key_pem.encode()
+    chain_bytes = chain_pem.encode()
+
+    if certificate_arn:
+        logger.info("Re-importing certificate to ACM: %s", certificate_arn)
+        response = acm_client.import_certificate(
+            Certificate=certificate_bytes,
+            PrivateKey=private_key_bytes,
+            CertificateChain=chain_bytes,
+            CertificateArn=certificate_arn,
+        )
     else:
         logger.info("Importing new certificate to ACM")
+        response = acm_client.import_certificate(
+            Certificate=certificate_bytes,
+            PrivateKey=private_key_bytes,
+            CertificateChain=chain_bytes,
+        )
 
-    response = acm_client.import_certificate(**kwargs)
-    arn: str = response["CertificateArn"]
+    arn_value = response.get("CertificateArn")
+    if not isinstance(arn_value, str):
+        raise RuntimeError("ACM import response did not include a valid CertificateArn")
+    arn = arn_value
     logger.info("ACM certificate ARN: %s", arn)
     return arn
 
@@ -195,6 +256,7 @@ def _import_to_acm(
 # ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
+
 
 def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
     """Renew a TLS certificate via ACME and import it to ACM.
@@ -221,10 +283,10 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
         account_key = _load_or_create_account_key()
 
         # 2. Build an ACME client
-        net = client.ClientNetwork(account_key, user_agent="acm-import-acme-automation/1.0")
-        directory = messages.Directory.from_json(
-            net.get(ACME_DIRECTORY_URL).json()
+        net = client.ClientNetwork(
+            account_key, user_agent="acm-import-acme-automation/1.0"
         )
+        directory = messages.Directory.from_json(net.get(ACME_DIRECTORY_URL).json())
         acme_client = client.ClientV2(directory, net)
 
         # 3. Register / find ACME account
@@ -232,10 +294,10 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
 
         # 4. Generate certificate private key and CSR
         cert_private_key = _generate_cert_key()
-        csr_der = _generate_csr(DOMAIN, cert_private_key)
+        csr_pem = _generate_csr(DOMAIN, cert_private_key)
 
         # 5. Create a new certificate order
-        order = acme_client.new_order(csr_der)
+        order = acme_client.new_order(csr_pem)
         logger.info("Created ACME order: %s", order.uri)
 
         # 6. Handle HTTP-01 challenges
@@ -252,9 +314,7 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
                         break
 
                 if http01_chall is None:
-                    raise RuntimeError(
-                        f"No HTTP-01 challenge found for {domain_name}"
-                    )
+                    raise RuntimeError(f"No HTTP-01 challenge found for {domain_name}")
 
                 token_path = http01_chall.chall.encode_token()
                 key_auth = http01_chall.chall.key_authorization(account_key)
@@ -262,7 +322,9 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
                 challenge_resources.append(token_path)
 
                 # Notify Let's Encrypt the challenge is ready
-                acme_client.answer_challenge(http01_chall, http01_chall.chall.response(account_key))
+                acme_client.answer_challenge(
+                    http01_chall, http01_chall.chall.response(account_key)
+                )
                 logger.info("Challenge answered for %s", domain_name)
 
             # 7. Finalise the order: poll authorisations then submit the CSR

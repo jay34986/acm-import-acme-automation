@@ -106,7 +106,8 @@ Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタックのパラメ�
 | `CHALLENGE_BUCKET` | CDKが自動設定 | ACME HTTP-01 チャレンジトークンを配置する S3 バケット名 |
 | `DOMAIN` | `--parameters Domain=` で設定 | 証明書を発行するIPアドレスまたはドメイン名 |
 | `CERTIFICATE_ARN` | `--parameters CertificateArn=` で設定 | 既存のACM証明書ARN (空の場合は新規インポート、指定した場合は上書き更新) |
-| `AWS_DEFAULT_REGION` | CDKにハードコード | AWSリージョン (`ap-northeast-1`) |
+
+> `AWS_DEFAULT_REGION` は Lambda ランタイム予約済みのため、CDKで手動設定していません。ランタイムが自動で設定します。
 
 ### ステージング環境でのテスト
 
@@ -145,6 +146,9 @@ aws lambda invoke \
 # TypeScript (ESLint)
 npm run lint
 
-# CDK (cdk-nag) — cdk synthesize時に自動実行
+# TypeScript コンパイル
 npm run build
+
+# CDK 合成（cdk-nag を含む検査）
+npx cdk synth
 ```

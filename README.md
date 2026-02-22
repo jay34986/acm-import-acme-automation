@@ -184,3 +184,18 @@ curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1/healthz
 ```
 
 `200` が返ればヘルスチェックパスは正常です。
+
+3. **Lambda実行で `No module named '_cffi_backend'` が出る場合**
+
+Lambdaの依存ライブラリにネイティブ拡張 (`cryptography` / `cffi`) が含まれるため、
+ローカル環境で作成した成果物を使うと Lambda 実行環境 (ARM64) と不整合になることがあります。
+
+このリポジトリでは依存関係を ARM64 向けでバンドルする構成にしているため、
+以下を再実行して関数を更新してください。
+
+```bash
+npm run build
+npx cdk deploy
+```
+
+再デプロイ後に再度 Lambda を手動実行し、`FunctionError` が出ないことを確認してください。

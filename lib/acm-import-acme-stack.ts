@@ -238,7 +238,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
                 'bash',
                 [
                   '-c',
-                  `set -euo pipefail && "${pythonExecutable}" -m pip install --no-cache-dir -r requirements.txt -t "${outputDir}" && cp -au . "${outputDir}"`,
+                  `set -euo pipefail && "${pythonExecutable}" -m pip install --no-cache-dir --upgrade pip && "${pythonExecutable}" -m pip install --no-cache-dir --target "${outputDir}" --platform manylinux2014_aarch64 --implementation cp --python-version 3.12 --only-binary=:all: -r requirements.txt && cp -au . "${outputDir}"`,
                 ],
                 {
                   cwd: renewCertLambdaSourcePath,
@@ -249,9 +249,8 @@ export class AcmImportAcmeStack extends cdk.Stack {
               return localBundling.status === 0;
             },
           },
-          // Lambda ARM64 ランタイムイメージを使用してネイティブビルドする。
-          // cryptography 等の Rust/C 拡張を含むパッケージをクロスコンパイルなしに
-          // 正しくインストールするため、SAM ビルドイメージ + --platform フラグ方式は使わない。
+          // Dockerが使える環境では Lambda ARM64 ランタイムイメージでバンドルする。
+          // Dockerが使えない環境では local.tryBundle の ARM64 wheel バンドルを使う。
           image: cdk.DockerImage.fromRegistry('public.ecr.aws/lambda/python:3.12-arm64'),
           platform: lambda.Architecture.ARM_64.dockerPlatform,
           command: [

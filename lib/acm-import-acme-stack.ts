@@ -7,6 +7,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
+import * as childProcess from 'node:child_process';
 import * as path from 'path';
 
 export class AcmImportAcmeStack extends cdk.Stack {
@@ -207,6 +208,47 @@ export class AcmImportAcmeStack extends cdk.Stack {
       ? lambda.Code.fromAsset(renewCertLambdaSourcePath)
       : lambda.Code.fromAsset(renewCertLambdaSourcePath, {
         bundling: {
+          local: {
+            tryBundle(outputDir: string): boolean {
+              const pythonCandidates = [
+                process.env.PYTHON,
+                process.env.npm_config_python,
+                process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python3') : undefined,
+                process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python') : undefined,
+                path.join(process.cwd(), '.venv/bin/python3'),
+                path.join(process.cwd(), '.venv/bin/python'),
+                'python3',
+                'python',
+              ].filter((candidate): candidate is string => candidate !== undefined && candidate.length > 0);
+
+              const pythonExecutable = pythonCandidates.find((candidate) => {
+                const probe = childProcess.spawnSync(candidate, ['-c', 'import sys'], {
+                  cwd: renewCertLambdaSourcePath,
+                  stdio: 'ignore',
+                });
+
+                return probe.status === 0;
+              });
+
+              if (!pythonExecutable) {
+                return false;
+              }
+
+              const localBundling = childProcess.spawnSync(
+                'bash',
+                [
+                  '-c',
+                  `set -euo pipefail && "${pythonExecutable}" -m pip install --no-cache-dir -r requirements.txt -t "${outputDir}" && cp -au . "${outputDir}"`,
+                ],
+                {
+                  cwd: renewCertLambdaSourcePath,
+                  stdio: 'inherit',
+                },
+              );
+
+              return localBundling.status === 0;
+            },
+          },
           // Lambda ARM64 ランタイムイメージを使用してネイティブビルドする。
           // cryptography 等の Rust/C 拡張を含むパッケージをクロスコンパイルなしに
           // 正しくインストールするため、SAM ビルドイメージ + --platform フラグ方式は使わない。

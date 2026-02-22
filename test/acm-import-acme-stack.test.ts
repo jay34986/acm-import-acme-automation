@@ -53,6 +53,7 @@ describe('AcmImportAcmeStack', () => {
 
     template.hasResourceProperties('AWS::Lambda::Function', {
       Runtime: 'python3.12',
+      Architectures: ['arm64'],
       Handler: 'handler.lambda_handler',
       Timeout: 300,
     });

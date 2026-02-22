@@ -7,7 +7,6 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
-import { execSync } from 'node:child_process';
 import * as path from 'path';
 
 export class AcmImportAcmeStack extends cdk.Stack {
@@ -208,24 +207,11 @@ export class AcmImportAcmeStack extends cdk.Stack {
       ? lambda.Code.fromAsset(renewCertLambdaSourcePath)
       : lambda.Code.fromAsset(renewCertLambdaSourcePath, {
         bundling: {
-          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
-          local: {
-            tryBundle(outputDir: string): boolean {
-              try {
-                execSync(
-                  `python3 -m pip install --no-cache-dir -r "${path.join(renewCertLambdaSourcePath, 'requirements.txt')}" -t "${outputDir}"`,
-                  { stdio: 'inherit' },
-                );
-                execSync(
-                  `cp -a "${renewCertLambdaSourcePath}/." "${outputDir}"`,
-                  { stdio: 'inherit' },
-                );
-                return true;
-              } catch {
-                return false;
-              }
-            },
-          },
+          // Lambda ARM64 ランタイムイメージを使用してネイティブビルドする。
+          // cryptography 等の Rust/C 拡張を含むパッケージをクロスコンパイルなしに
+          // 正しくインストールするため、SAM ビルドイメージ + --platform フラグ方式は使わない。
+          image: cdk.DockerImage.fromRegistry('public.ecr.aws/lambda/python:3.12-arm64'),
+          platform: lambda.Architecture.ARM_64.dockerPlatform,
           command: [
             'bash',
             '-c',
@@ -236,6 +222,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
 
     const renewCertLambda = new lambda.Function(this, 'RenewCertLambda', {
       runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'handler.lambda_handler',
       code: renewCertLambdaCode,
       role: lambdaRole,

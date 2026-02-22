@@ -12,6 +12,7 @@
 - Lambda (ACMEクライアント) が HTTP-01 で証明書を取得して ACM へインポート
 - EC2 nginx は `/.well-known/acme-challenge/` を S3 にプロキシ
 - 証明書対象ドメインは `<NlbPublicIp>.<AcmeDomainSuffix>`
+- NLBターゲットグループのヘルスチェックは `HTTP /healthz` を使用
 
 | リソース | 内容 |
 |---|---|
@@ -23,8 +24,6 @@
 | Lambda (Python 3.12) | ACMEプロトコル (Let's Encrypt) で証明書を取得・更新 |
 | Secrets Manager | ACMEアカウントキーおよびTLS証明書データを保管 |
 | S3 | ACME HTTP-01チャレンジトークンの一時保管 |
-
-NLBターゲットグループのヘルスチェックは `HTTP /healthz` を使用します。
 
 ## 前提条件
 
@@ -44,19 +43,22 @@ npm run build
 
 デプロイは2回に分けて実施します。
 
+### CDKパラメータ
+
+| パラメータ | 用途 | 既定値 |
+|---|---|---|
+| `AcmeDomainSuffix` | 証明書対象FQDNのドメインサフィックス | `nip.io` |
+| `AcmeDirectoryUrl` | ACMEディレクトリURL | `https://acme-staging-v02.api.letsencrypt.org/directory` |
+| `CertificateArn` | NLB TLSリスナーに設定するACM証明書ARN（2回目デプロイで使用） | 空文字 |
+
 ### 第1回デプロイ（インフラ構築）
 
 このデプロイでは NLB (TCP:80 リスナーのみ) と EC2 などのインフラを構築します。 
 `AcmeDomainSuffix` はデフォルトで `nip.io` です。
+`AcmeDirectoryUrl` は既定で Let’s Encrypt staging を使用します（検証向け）。
 
 ```bash
 npx cdk synth
-npx cdk deploy --require-approval never
-```
-
-必要に応じてドメインサフィックスを明示指定できます。
-
-```bash
 npx cdk deploy --require-approval never \
   --parameters AcmeDomainSuffix=nip.io
 ```
@@ -96,6 +98,28 @@ npx cdk deploy --require-approval never \
   --parameters CertificateArn=$(jq -r '.body | fromjson | .certificateArn' response.json)
 ```
 
+## staging / production の切替
+
+### 既定（staging）
+
+既定値:
+
+```text
+https://acme-staging-v02.api.letsencrypt.org/directory
+```
+
+### production へ切替する場合
+
+本番証明書を発行する場合のみ、`AcmeDirectoryUrl` を production URL に変更してデプロイします。
+
+```bash
+npx cdk deploy --require-approval never \
+  --parameters AcmeDomainSuffix=nip.io \
+  --parameters AcmeDirectoryUrl=https://acme-v02.api.letsencrypt.org/directory
+```
+
+> staging証明書はブラウザに信頼されません。動作確認用途として使用してください。
+
 ## Lambda環境変数
 
 Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタック定義から自動的に設定されます。  
@@ -126,17 +150,14 @@ aws lambda update-function-configuration \
 
 ## トラブルシュート
 
-### `sslip.io` でレート制限エラーになる
+### `too many certificates ... for "<dynamic-dns-domain>"`
 
-以下のようなエラーが出る場合、Let's Encrypt 側の `sslip.io` 登録ドメイン単位レート制限です。
-
-```text
-too many certificates ... for "sslip.io"
-```
+Let's Encrypt の登録ドメイン単位レート制限です。
 
 対処:
-- `AcmeDomainSuffix=nip.io` など別の動的DNSサフィックスを使用
-- ステージングでの動作確認時は `ACME_DIRECTORY_URL` を staging に変更
+- staging を使う（本リポジトリの既定）
+- `AcmeDomainSuffix` を別の動的DNSサフィックスへ変更
+- 本番運用時は独自ドメインを使用
 
 ### NLB ヘルスチェックが `unhealthy`
 

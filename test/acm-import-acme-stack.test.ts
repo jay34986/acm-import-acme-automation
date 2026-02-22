@@ -89,4 +89,23 @@ describe('AcmImportAcmeStack', () => {
       },
     });
   });
+
+  test('RenewCertLambda ACME_DIRECTORY_URL environment variable is configurable by parameter', () => {
+    const app = new cdk.App();
+    const stack = new AcmImportAcmeStack(app, 'TestStackAcmeDirectoryUrl', {
+      env: { region: 'ap-northeast-1' },
+    });
+
+    const template = Template.fromStack(stack);
+
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: {
+          ACME_DIRECTORY_URL: {
+            Ref: 'AcmeDirectoryUrl',
+          },
+        },
+      },
+    });
+  });
 });

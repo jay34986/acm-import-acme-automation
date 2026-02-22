@@ -37,6 +37,14 @@ export class AcmImportAcmeStack extends cdk.Stack {
       default: 'nip.io',
     });
 
+    const acmeDirectoryUrlParam = new cdk.CfnParameter(this, 'AcmeDirectoryUrl', {
+      type: 'String',
+      description:
+        'ACME directory URL. Default uses Let\'s Encrypt staging for validation environments. ' +
+        'Use production URL only for final issuance.',
+      default: 'https://acme-staging-v02.api.letsencrypt.org/directory',
+    });
+
     // Condition: only create the TLS listener when a certificate ARN is provided
     const hasCert = new cdk.CfnCondition(this, 'HasCertificate', {
       expression: cdk.Fn.conditionNot(
@@ -294,7 +302,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
       memorySize: 256,
       description: 'Renews TLS certificates via ACME (Let\'s Encrypt) and imports them to ACM',
       environment: {
-        ACME_DIRECTORY_URL: 'https://acme-v02.api.letsencrypt.org/directory',
+        ACME_DIRECTORY_URL: acmeDirectoryUrlParam.valueAsString,
         ACME_ACCOUNT_SECRET_ARN: acmeAccountSecret.secretArn,
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,

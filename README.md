@@ -1,14 +1,17 @@
 # acm-import-acme-automation
 
-短期間化する証明書有効期間対応のために、ACMに外部取得した証明書をインポートし、ACMEクライアントをLambdaで実行して自動更新する検証用リポジトリ。
-
----
+短期間化する証明書有効期間対応のために、ACMに外部取得した証明書をインポートし、ACMEクライアントをLambdaで実行して自動更新する検証用リポジトリです。
 
 ## 構成
 
-```
+```text
 インターネット → NLB (TLS終端 / ACM証明書) → EC2 (HTTP / nginx)
 ```
+
+- NLB は EIP を持つインターネット向け構成
+- `DOMAIN` は `<NlbPublicIp>.sslip.io` を使用し、Let's Encrypt でドメイン証明書を発行
+- Lambda (ACMEクライアント) が HTTP-01 で証明書を取得して ACM へインポート
+- EC2 nginx は `/.well-known/acme-challenge/` を S3 にプロキシ
 
 | リソース | 内容 |
 |---|---|
@@ -22,8 +25,6 @@
 | S3 | ACME HTTP-01チャレンジトークンの一時保管 |
 
 NLBターゲットグループのヘルスチェックは `HTTP /healthz` を使用します。
-
----
 
 ## 前提条件
 
@@ -41,8 +42,6 @@ npx cdk bootstrap
 npm run build
 ```
 
----
-
 ## デプロイ手順
 
 デプロイは **2回** に分けて行います。
@@ -56,9 +55,9 @@ npx cdk synth
 npx cdk deploy
 ```
 
-> **ヒント**: デプロイ完了後、出力の `NlbPublicIp` に表示される静的IPアドレスが証明書のサブジェクトになります。
+デプロイ後、`NlbSslipFqdn` が証明書の対象FQDNです。
 
-デプロイ完了後、Lambda (`RenewCertLambda`) を手動実行して証明書を取得します。
+### Lambda手動実行（証明書取得・ACMインポート）
 
 ```bash
 # Lambda関数名を取得
@@ -88,12 +87,9 @@ cat response.json
 これにより NLB に TLS:443 リスナーが追加され、エンドツーエンドのHTTPS通信が有効になります。
 
 ```bash
-cdk deploy \
-  --parameters CertificateArn=<第1回デプロイで取得したACM証明書ARN>
+npx cdk deploy \
+  --parameters CertificateArn=$(jq -r '.body | fromjson | .certificateArn' response.json)
 ```
-
----
-
 ## Lambdaの環境変数
 
 Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタック定義から自動的に設定されます。  
@@ -127,28 +123,15 @@ aws lambda update-function-configuration \
 
 > ステージング証明書はブラウザに信頼されません。動作確認後は本番URLに戻してください。
 
----
 
-## 実装メモ（IP証明書対応）
+## 検証コマンド
 
-IP証明書対応時にハマりやすい点を、記録としてまとめます。
-
-- **Let's Encryptエンドポイントの扱い**
-  - 利用するACMEディレクトリURLは `https://acme-v02.api.letsencrypt.org/directory`（本番）
-  - ステージングは `https://acme-staging-v02.api.letsencrypt.org/directory`
-  - プロファイル情報はディレクトリオブジェクトのトップレベルではなく `meta.profiles` 側にある
-
-- **`acme` ライブラリのバージョンアップが必要だった理由**
-  - `acme==2.11.0` では `ClientV2.new_order()` に `profile` 引数がなく、IP証明書必須の `shortlived` を指定できない
-  - そのため `acme==5.3.1` に更新（合わせて `josepy>=2.0.0` / `cryptography>=43.0.0` へ更新）
-
-- **上記以外に残しておくべきポイント**
-  - `acme` 5系では例外・チャレンジAPIが一部変わっている（`ConflictError.location`、HTTP-01トークン取得）
-  - IP証明書のCSRは `SAN=iPAddress` で作成し、IPを `Common Name` に入れない実装にしている
-  - 現在の主な失敗要因はコードではなく HTTP-01 到達性（`Timeout during connect`）で、NLB:80 到達・nginx応答・経路制御の確認が必要
-  - IP証明書は短期（約6日）なので、検証後は手動運用ではなく自動実行方式（EventBridgeなど）への移行を前提にする
-
----
+```bash
+npm run build
+npm run lint
+npm test
+npx cdk synth
+```
 
 ## 証明書の更新
 
@@ -161,24 +144,11 @@ aws lambda invoke \
   --region ap-northeast-1 \
   --payload '{}' \
   response.json
-```
 
----
+## 費用を抑えるための補足
 
-## スタティック解析
-
-```bash
-# TypeScript (ESLint)
-npm run lint
-
-# TypeScript コンパイル
-npm run build
-
-# CDK 合成（cdk-nag を含む検査）
-npx cdk synth
-```
-
----
+- 現状の `t4g.nano + single-AZ + NATなし` は、要件を満たしつつ安価な構成です。
+- さらに抑える場合は、検証後にスタックを削除して従量課金を止める運用が有効です。
 
 ## トラブルシュート（NLBヘルスチェックがunhealthyになる場合）
 

@@ -59,4 +59,31 @@ describe('AcmImportAcmeStack', () => {
       Timeout: 300,
     });
   });
+
+  test('RenewCertLambda DOMAIN environment variable uses sslip.io FQDN', () => {
+    const app = new cdk.App();
+    const stack = new AcmImportAcmeStack(app, 'TestStackSslipDomain', {
+      env: { region: 'ap-northeast-1' },
+    });
+
+    const template = Template.fromStack(stack);
+
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: {
+          DOMAIN: {
+            'Fn::Join': [
+              '',
+              [
+                {
+                  Ref: 'NlbEip',
+                },
+                '.sslip.io',
+              ],
+            ],
+          },
+        },
+      },
+    });
+  });
 });

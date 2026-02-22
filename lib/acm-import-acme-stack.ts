@@ -66,11 +66,13 @@ export class AcmImportAcmeStack extends cdk.Stack {
     ]);
 
     // -------------------------------------------------------------------------
-    // Elastic IP for the NLB (static IP used as the certificate subject)
+    // Elastic IP for the NLB
     // -------------------------------------------------------------------------
     const nlbEip = new ec2.CfnEIP(this, 'NlbEip', {
       domain: 'vpc',
     });
+
+    const nlbSslipFqdn = cdk.Fn.join('', [nlbEip.ref, '.sslip.io']);
 
     // -------------------------------------------------------------------------
     // S3 Bucket: ACME HTTP-01 challenge tokens
@@ -288,7 +290,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
         ACME_ACCOUNT_SECRET_ARN: acmeAccountSecret.secretArn,
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,
-        DOMAIN: nlbEip.ref,
+        DOMAIN: nlbSslipFqdn,
         CERTIFICATE_ARN: certArnParam.valueAsString,
       },
     });
@@ -312,7 +314,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     );
 
     // -------------------------------------------------------------------------
-    // Security Group for EC2 (HTTP from VPC only; TLS is terminated at the NLB)
+    // Security Group for EC2 (HTTP from Internet; TLS is terminated at the NLB)
     // -------------------------------------------------------------------------
     const webServerSg = new ec2.SecurityGroup(this, 'WebServerSg', {
       vpc,
@@ -536,6 +538,11 @@ export class AcmImportAcmeStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'NlbDnsName', {
       value: cfnNlb.attrDnsName,
       description: 'DNS name of the Network Load Balancer',
+    });
+
+    new cdk.CfnOutput(this, 'NlbSslipFqdn', {
+      value: nlbSslipFqdn,
+      description: 'sslip.io FQDN derived from the NLB Elastic IP (used for ACME HTTP-01)',
     });
 
     new cdk.CfnOutput(this, 'ChallengeBucketName', {

@@ -29,6 +29,14 @@ export class AcmImportAcmeStack extends cdk.Stack {
       default: '',
     });
 
+    const acmeDomainSuffixParam = new cdk.CfnParameter(this, 'AcmeDomainSuffix', {
+      type: 'String',
+      description:
+        'Domain suffix for ACME validation FQDN. The issued domain becomes <NlbPublicIp>.<suffix>. ' +
+        'Use a dynamic DNS suffix such as nip.io. sslip.io may fail due to Let\'s Encrypt rate limits.',
+      default: 'nip.io',
+    });
+
     // Condition: only create the TLS listener when a certificate ARN is provided
     const hasCert = new cdk.CfnCondition(this, 'HasCertificate', {
       expression: cdk.Fn.conditionNot(
@@ -72,7 +80,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
       domain: 'vpc',
     });
 
-    const nlbSslipFqdn = cdk.Fn.join('', [nlbEip.ref, '.sslip.io']);
+    const nlbAcmeFqdn = cdk.Fn.join('', [nlbEip.ref, '.', acmeDomainSuffixParam.valueAsString]);
 
     // -------------------------------------------------------------------------
     // S3 Bucket: ACME HTTP-01 challenge tokens
@@ -290,7 +298,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
         ACME_ACCOUNT_SECRET_ARN: acmeAccountSecret.secretArn,
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,
-        DOMAIN: nlbSslipFqdn,
+        DOMAIN: nlbAcmeFqdn,
         CERTIFICATE_ARN: certArnParam.valueAsString,
       },
     });
@@ -540,9 +548,9 @@ export class AcmImportAcmeStack extends cdk.Stack {
       description: 'DNS name of the Network Load Balancer',
     });
 
-    new cdk.CfnOutput(this, 'NlbSslipFqdn', {
-      value: nlbSslipFqdn,
-      description: 'sslip.io FQDN derived from the NLB Elastic IP (used for ACME HTTP-01)',
+    new cdk.CfnOutput(this, 'NlbAcmeFqdn', {
+      value: nlbAcmeFqdn,
+      description: 'ACME FQDN derived from NLB Elastic IP and AcmeDomainSuffix (used for HTTP-01)',
     });
 
     new cdk.CfnOutput(this, 'ChallengeBucketName', {

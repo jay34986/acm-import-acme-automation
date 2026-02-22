@@ -60,9 +60,9 @@ describe('AcmImportAcmeStack', () => {
     });
   });
 
-  test('RenewCertLambda DOMAIN environment variable uses sslip.io FQDN', () => {
+  test('RenewCertLambda DOMAIN environment variable uses ACME FQDN from parameters', () => {
     const app = new cdk.App();
-    const stack = new AcmImportAcmeStack(app, 'TestStackSslipDomain', {
+    const stack = new AcmImportAcmeStack(app, 'TestStackAcmeDomain', {
       env: { region: 'ap-northeast-1' },
     });
 
@@ -78,7 +78,10 @@ describe('AcmImportAcmeStack', () => {
                 {
                   Ref: 'NlbEip',
                 },
-                '.sslip.io',
+                '.',
+                {
+                  Ref: 'AcmeDomainSuffix',
+                },
               ],
             ],
           },

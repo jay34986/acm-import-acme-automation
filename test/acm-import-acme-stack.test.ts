@@ -108,4 +108,25 @@ describe('AcmImportAcmeStack', () => {
       },
     });
   });
+
+  test('WebServer Security Group allows HTTP from internet for ACME HTTP-01', () => {
+    const app = new cdk.App();
+    const stack = new AcmImportAcmeStack(app, 'TestStackWebServerSg', {
+      env: { region: 'ap-northeast-1' },
+    });
+
+    const template = Template.fromStack(stack);
+
+    template.hasResourceProperties('AWS::EC2::SecurityGroup', {
+      SecurityGroupIngress: [
+        {
+          CidrIp: '0.0.0.0/0',
+          Description: 'Allow HTTP from internet clients via NLB (source IP preserved)',
+          FromPort: 80,
+          IpProtocol: 'tcp',
+          ToPort: 80,
+        },
+      ],
+    });
+  });
 });

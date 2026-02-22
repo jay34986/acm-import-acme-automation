@@ -85,6 +85,29 @@ aws lambda invoke \
 cat response.json
 ```
 
+`Timeout during connect (likely firewall problem)` が出る場合は、まず第1回デプロイを再実施して
+Security Group / user-data の最新設定を反映し、以下で HTTP 到達性を確認してください。
+
+```bash
+NLB_PUBLIC_IP=$(aws cloudformation describe-stacks \
+  --stack-name AcmImportAcmeStack \
+  --region ap-northeast-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='NlbPublicIp'].OutputValue" \
+  --output text)
+
+CHALLENGE_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name AcmImportAcmeStack \
+  --region ap-northeast-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='ChallengeBucketName'].OutputValue" \
+  --output text)
+
+TOKEN="preflight-$(date +%s)"
+aws s3 cp <(printf 'ok') "s3://${CHALLENGE_BUCKET}/.well-known/acme-challenge/${TOKEN}" --region ap-northeast-1
+curl -sS -D - "http://${NLB_PUBLIC_IP}.nip.io/.well-known/acme-challenge/${TOKEN}"
+```
+
+`HTTP/1.1 200` と本文 `ok` が返る状態であれば、HTTP-01 の前提を満たしています。
+
 実行結果の `certificateArn` フィールドに ACM 証明書の ARN が記録されます。次のデプロイで使用します。
 
 ### 第2回デプロイ（NLB TLSリスナー有効化）
@@ -185,6 +208,7 @@ aws lambda invoke \
   --region ap-northeast-1 \
   --payload '{}' \
   response.json
+```
 
 ## 費用を抑えるための補足
 
@@ -238,6 +262,10 @@ npx cdk deploy
 4. **ACME HTTP-01 が `Timeout during connect` / `403 AccessDenied` になる場合**
 
 IP証明書の検証で `/.well-known/acme-challenge/*` が失敗する場合、以下を順に確認してください。
+
+- **Lambda の事前到達性チェック結果を確認**
+  - 本実装では challenge 配信後に `http://<DOMAIN>/.well-known/acme-challenge/<token>` へ事前アクセスし、`200 + 本文一致` を確認してから ACME 応答します。
+  - `HTTP-01 precheck failed` が返る場合は、ACME 側ではなく到達性（SG/NLB/nginx/S3）を優先して修正してください。
 
 - **NLBのSource IP保持に伴うSecurity Group設定**
   - NLB (instanceターゲット) はクライアントIPを保持してEC2へ転送します。

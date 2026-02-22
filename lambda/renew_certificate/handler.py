@@ -18,6 +18,9 @@ import ipaddress
 import json
 import logging
 import os
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from typing import Final, Protocol, cast
 
@@ -65,6 +68,15 @@ class AcmClient(Protocol):
         CertificateChain: bytes,
         CertificateArn: str | None = None,
     ) -> Mapping[str, object]: ...
+
+
+class AcmeClientWithProfile(Protocol):
+    def new_order(
+        self,
+        csr_pem: bytes,
+        *,
+        profile: str,
+    ) -> messages.OrderResource: ...
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +255,42 @@ def _delete_challenge_token(token_path: str) -> None:
         logger.warning("Failed to delete challenge token: %s", exc)
 
 
+def _verify_http_challenge_reachability(
+    token_path: str, key_authorisation: str
+) -> None:
+    """Verify that the HTTP-01 token is publicly reachable before answering ACME challenge."""
+    challenge_url = f"http://{DOMAIN}/.well-known/acme-challenge/{token_path}"
+    deadline = time.monotonic() + 30.0
+    last_error = ""
+
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(challenge_url, timeout=5) as response:
+                status_code = response.getcode()
+                body_bytes = response.read()
+
+            body = body_bytes.decode().strip()
+            expected = key_authorisation.strip()
+
+            if status_code == 200 and body == expected:
+                logger.info("Challenge URL is reachable: %s", challenge_url)
+                return
+
+            last_error = (
+                f"Unexpected challenge response (status={status_code}, "
+                f"body_matches={body == expected})"
+            )
+        except urllib.error.URLError as exc:
+            last_error = str(exc)
+
+        time.sleep(2)
+
+    raise RuntimeError(
+        "HTTP-01 precheck failed: challenge URL is not reachable from public network. "
+        f"url={challenge_url}, last_error={last_error}"
+    )
+
+
 def _store_cert_in_secrets_manager(
     certificate_pem: str,
     private_key_pem: str,
@@ -349,7 +397,11 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
         csr_pem = _generate_csr(DOMAIN, cert_private_key)
 
         # 5. Create a new certificate order
-        order = acme_client.new_order(csr_pem, profile=acme_profile)
+        if acme_profile is None:
+            order = acme_client.new_order(csr_pem)
+        else:
+            profiled_acme_client = cast(AcmeClientWithProfile, acme_client)
+            order = profiled_acme_client.new_order(csr_pem, profile=acme_profile)
         logger.info("Created ACME order: %s", order.uri)
 
         # 6. Handle HTTP-01 challenges
@@ -375,6 +427,9 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
                 key_auth = http01_chall.chall.key_authorization(account_key)
                 _upload_challenge_token(token_path, key_auth)
                 challenge_resources.append(token_path)
+
+                # Confirm that the challenge file is publicly reachable before notifying ACME.
+                _verify_http_challenge_reachability(token_path, key_auth)
 
                 # Notify Let's Encrypt the challenge is ready
                 acme_client.answer_challenge(

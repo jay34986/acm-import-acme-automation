@@ -334,7 +334,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // -------------------------------------------------------------------------
     const webServerSg = new ec2.SecurityGroup(this, 'WebServerSg', {
       vpc,
-      description: 'Security group for the ACME web server (HTTP from VPC only; TLS terminated at NLB)',
+      description: 'Security group for the ACME web server (HTTP from internet via NLB; TLS terminated at NLB)',
       allowAllOutbound: true,
     });
 

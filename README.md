@@ -21,12 +21,14 @@
 | Secrets Manager | ACMEアカウントキーおよびTLS証明書データを保管 |
 | S3 | ACME HTTP-01チャレンジトークンの一時保管 |
 
+NLBターゲットグループのヘルスチェックは `HTTP /healthz` を使用します。
+
 ---
 
 ## 前提条件
 
 - AWS CLI および CDK CLI がインストール済みであること
-- `cdk bootstrap` が対象アカウント・東京リージョン (`ap-northeast-1`) で実行済みであること
+- `aws login` 等で東京リージョン (`ap-northeast-1`) でAWS CLIが使用可能な状態であること
 - Node.js 18 以上がインストール済みであること
 
 ---
@@ -49,7 +51,8 @@ npm run build
 このデプロイでは NLB (TCP:80 リスナーのみ) と EC2 などのインフラを構築します。  
 
 ```bash
-cdk deploy
+npx cdk bootstrap
+npx cdk deploy
 ```
 
 > **ヒント**: デプロイ完了後、出力の `NlbPublicIp` に表示される静的IPアドレスが証明書のサブジェクトになります。
@@ -149,3 +152,34 @@ npm run build
 # CDK 合成（cdk-nag を含む検査）
 npx cdk synth
 ```
+
+---
+
+## トラブルシュート（NLBヘルスチェックがunhealthyになる場合）
+
+第1回デプロイ後にターゲットが `unhealthy` の場合は、以下を確認してください。
+
+1. **EC2でnginxが起動しているか**
+
+```bash
+INSTANCE_ID=$(aws cloudformation describe-stack-resources \
+  --stack-name AcmImportAcmeStack \
+  --region ap-northeast-1 \
+  --query "StackResources[?LogicalResourceId=='WebServer'].PhysicalResourceId" \
+  --output text)
+
+aws ssm start-session --target "$INSTANCE_ID" --region ap-northeast-1
+
+# EC2セッション内で実行
+sudo systemctl status nginx
+sudo nginx -t
+```
+
+2. **ヘルスチェックパスが応答するか**
+
+```bash
+# EC2セッション内で実行
+curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1/healthz
+```
+
+`200` が返ればヘルスチェックパスは正常です。

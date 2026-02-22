@@ -294,7 +294,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
       'set -euo pipefail',
 
       // Install nginx
-      'dnf update -y',
       'dnf install -y nginx',
 
       // Write nginx config
@@ -314,6 +313,11 @@ export class AcmImportAcmeStack extends cdk.Stack {
       '        root   /usr/share/nginx/html;',
       '        index  index.html index.htm;',
       '    }',
+      '',
+      '    location = /healthz {',
+      '        add_header Content-Type text/plain;',
+      '        return 200 "ok";',
+      '    }',
       '}',
       'NGINXEOF',
 
@@ -324,9 +328,14 @@ export class AcmImportAcmeStack extends cdk.Stack {
       // Remove default server config to avoid conflicts
       'rm -f /etc/nginx/conf.d/default.conf',
 
+      // Write a default index page to avoid missing-content issues
+      'echo "acm-import-acme-automation" > /usr/share/nginx/html/index.html',
+
+      // Validate nginx config before startup
+      'nginx -t',
+
       // Enable and start nginx
-      'systemctl enable nginx',
-      'systemctl start nginx',
+      'systemctl enable --now nginx',
     );
 
     // -------------------------------------------------------------------------
@@ -399,7 +408,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
       targetType: 'instance',
       targets: [{ id: instance.instanceId }],
       healthCheckProtocol: 'HTTP',
-      healthCheckPath: '/',
+      healthCheckPath: '/healthz',
       healthCheckPort: '80',
     });
 

@@ -17,5 +17,13 @@
     "@typescript-eslint/no-explicit-any": "warn",
     "no-console": "off"
   },
+  "overrides": [
+    {
+      "files": ["test/**/*.ts"],
+      "env": {
+        "jest": true
+      }
+    }
+  ],
   "ignorePatterns": ["dist/", "cdk.out/", "node_modules/"]
 }

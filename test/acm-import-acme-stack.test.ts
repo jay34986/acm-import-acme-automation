@@ -39,6 +39,7 @@ describe('AcmImportAcmeStack', () => {
 
     expect(userDataJson).toContain('location = /healthz {');
     expect(userDataJson).toContain('return 200');
+    expect(userDataJson).toContain('proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;');
     expect(userDataJson).toContain('nginx -t');
     expect(userDataJson).toContain('systemctl enable --now nginx');
   });

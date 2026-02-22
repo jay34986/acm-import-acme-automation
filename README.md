@@ -223,3 +223,31 @@ npx cdk deploy
 ```
 
 再デプロイ後に再度 Lambda を手動実行し、`FunctionError` が出ないことを確認してください。
+
+4. **ACME HTTP-01 が `Timeout during connect` / `403 AccessDenied` になる場合**
+
+IP証明書の検証で `/.well-known/acme-challenge/*` が失敗する場合、以下を順に確認してください。
+
+- **NLBのSource IP保持に伴うSecurity Group設定**
+  - NLB (instanceターゲット) はクライアントIPを保持してEC2へ転送します。
+  - EC2のSecurity Groupで `tcp/80` をクライアント送信元から受けられる設定にしてください。
+  - VPC CIDR のみ許可だと、外部からのHTTP-01検証が到達できず `Timeout` になります。
+
+- **nginx の S3プロキシTLS検証設定**
+  - `proxy_ssl_verify on;` を使う場合、`proxy_ssl_trusted_certificate` の指定が必要です。
+  - 例: `/etc/pki/tls/certs/ca-bundle.crt`
+  - 未設定だと nginx 起動時に `no proxy_ssl_trusted_certificate for proxy_ssl_verify` で失敗します。
+
+- **S3 challengeプレフィックスの公開読取**
+  - `/.well-known/acme-challenge/*` をS3へ `proxy_pass` する場合、Let's Encrypt からの取得は匿名アクセスになります。
+  - バケット全体ではなく、`/.well-known/acme-challenge/*` のみ `s3:GetObject` を許可してください。
+  - 未設定だと `403 AccessDenied` になります。
+
+確認コマンド例:
+
+```bash
+curl -sS -D - http://<NlbPublicIp>/healthz
+curl -sS -D - http://<NlbPublicIp>/.well-known/acme-challenge/<token>
+```
+
+`/healthz` が `200`、challengeパスが `200` でトークン本文を返せる状態になれば、HTTP-01の前提は満たせます。

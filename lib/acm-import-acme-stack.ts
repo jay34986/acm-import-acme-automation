@@ -91,7 +91,12 @@ export class AcmImportAcmeStack extends cdk.Stack {
     ]);
 
     const challengeBucket = new s3.Bucket(this, 'ChallengeBucket', {
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      blockPublicAccess: new s3.BlockPublicAccess({
+        blockPublicAcls: true,
+        ignorePublicAcls: true,
+        blockPublicPolicy: false,
+        restrictPublicBuckets: false,
+      }),
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
       versioned: false,
@@ -104,9 +109,17 @@ export class AcmImportAcmeStack extends cdk.Stack {
     NagSuppressions.addResourceSuppressions(challengeBucket, [
       {
         id: 'AwsSolutions-S2',
-        reason: 'Public access is intentionally blocked; nginx proxies .well-known/acme-challenge/ to S3 via IAM',
+        reason: 'Only .well-known/acme-challenge/ objects are intentionally world-readable for ACME HTTP-01 validation',
       },
     ]);
+
+    challengeBucket.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'AllowAnonymousReadForAcmeChallengePrefix',
+      effect: iam.Effect.ALLOW,
+      principals: [new iam.AnyPrincipal()],
+      actions: ['s3:GetObject'],
+      resources: [challengeBucket.arnForObjects('.well-known/acme-challenge/*')],
+    }));
 
     // -------------------------------------------------------------------------
     // Secrets Manager: ACME account private key
@@ -307,12 +320,20 @@ export class AcmImportAcmeStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // Allow HTTP from within the VPC (NLB-to-EC2 traffic and NLB health checks)
+    // Allow HTTP from internet clients via NLB.
+    // NLB preserves source IP, so instance SG must allow client source addresses.
     webServerSg.addIngressRule(
-      ec2.Peer.ipv4(vpcCidr),
+      ec2.Peer.anyIpv4(),
       ec2.Port.tcp(80),
-      'Allow HTTP from VPC (NLB to EC2)',
+      'Allow HTTP from internet clients via NLB (source IP preserved)',
     );
+
+    NagSuppressions.addResourceSuppressions(webServerSg, [
+      {
+        id: 'AwsSolutions-EC23',
+        reason: 'NLB preserves client source IP for instance targets; EC2 SG must allow HTTP/80 from internet to receive traffic via NLB for ACME HTTP-01',
+      },
+    ]);
 
     // -------------------------------------------------------------------------
     // IAM Role for EC2
@@ -367,6 +388,8 @@ export class AcmImportAcmeStack extends cdk.Stack {
       '    location /.well-known/acme-challenge/ {',
       `        proxy_pass https://s3.${deploymentRegion}.amazonaws.com/\${CHALLENGE_BUCKET}/.well-known/acme-challenge/;`,
       `        proxy_set_header Host s3.${deploymentRegion}.amazonaws.com;`,
+      '        proxy_ssl_server_name on;',
+      '        proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;',
       '        proxy_ssl_verify on;',
       '    }',
       '',

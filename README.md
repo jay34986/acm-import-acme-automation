@@ -37,6 +37,7 @@ NLBターゲットグループのヘルスチェックは `HTTP /healthz` を使
 
 ```bash
 npm install
+npx cdk bootstrap
 npm run build
 ```
 
@@ -51,7 +52,7 @@ npm run build
 このデプロイでは NLB (TCP:80 リスナーのみ) と EC2 などのインフラを構築します。  
 
 ```bash
-npx cdk bootstrap
+npx cdk synth
 npx cdk deploy
 ```
 

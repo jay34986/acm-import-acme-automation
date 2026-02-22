@@ -42,4 +42,19 @@ describe('AcmImportAcmeStack', () => {
     expect(userDataJson).toContain('nginx -t');
     expect(userDataJson).toContain('systemctl enable --now nginx');
   });
+
+  test('RenewCertLambda uses expected runtime and handler configuration', () => {
+    const app = new cdk.App();
+    const stack = new AcmImportAcmeStack(app, 'TestStackLambda', {
+      env: { region: 'ap-northeast-1' },
+    });
+
+    const template = Template.fromStack(stack);
+
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Runtime: 'python3.12',
+      Handler: 'handler.lambda_handler',
+      Timeout: 300,
+    });
+  });
 });

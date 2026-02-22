@@ -7,6 +7,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
+import { execSync } from 'node:child_process';
 import * as path from 'path';
 
 export class AcmImportAcmeStack extends cdk.Stack {
@@ -201,10 +202,42 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // -------------------------------------------------------------------------
     // Lambda: Certificate Renewal
     // -------------------------------------------------------------------------
+    const renewCertLambdaSourcePath = path.join(__dirname, '../lambda/renew_certificate');
+    const isJestRuntime = process.env.JEST_WORKER_ID !== undefined;
+    const renewCertLambdaCode = isJestRuntime
+      ? lambda.Code.fromAsset(renewCertLambdaSourcePath)
+      : lambda.Code.fromAsset(renewCertLambdaSourcePath, {
+        bundling: {
+          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+          local: {
+            tryBundle(outputDir: string): boolean {
+              try {
+                execSync(
+                  `python3 -m pip install --no-cache-dir -r "${path.join(renewCertLambdaSourcePath, 'requirements.txt')}" -t "${outputDir}"`,
+                  { stdio: 'inherit' },
+                );
+                execSync(
+                  `cp -a "${renewCertLambdaSourcePath}/." "${outputDir}"`,
+                  { stdio: 'inherit' },
+                );
+                return true;
+              } catch {
+                return false;
+              }
+            },
+          },
+          command: [
+            'bash',
+            '-c',
+            'pip install --no-cache-dir -r requirements.txt -t /asset-output && cp -au . /asset-output',
+          ],
+        },
+      });
+
     const renewCertLambda = new lambda.Function(this, 'RenewCertLambda', {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'handler.lambda_handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/renew_certificate')),
+      code: renewCertLambdaCode,
       role: lambdaRole,
       timeout: cdk.Duration.minutes(5),
       memorySize: 256,

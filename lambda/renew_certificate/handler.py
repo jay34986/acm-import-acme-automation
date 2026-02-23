@@ -317,33 +317,148 @@ def _import_to_acm(
     chain_pem: str,
 ) -> str:
     """Import (or re-import) the certificate into ACM. Returns the certificate ARN."""
-    certificate_arn = CERTIFICATE_ARN
-    certificate_bytes = certificate_pem.encode()
-    private_key_bytes = private_key_pem.encode()
-    chain_bytes = chain_pem.encode()
+    kwargs: dict[str, bytes | str] = {
+        "Certificate": certificate_pem.encode(),
+        "PrivateKey": private_key_pem.encode(),
+        "CertificateChain": chain_pem.encode(),
+    }
 
-    if certificate_arn:
-        logger.info("Re-importing certificate to ACM: %s", certificate_arn)
-        response = acm_client.import_certificate(
-            Certificate=certificate_bytes,
-            PrivateKey=private_key_bytes,
-            CertificateChain=chain_bytes,
-            CertificateArn=certificate_arn,
-        )
+    if CERTIFICATE_ARN:
+        kwargs["CertificateArn"] = CERTIFICATE_ARN
+        logger.info("Re-importing certificate to ACM: %s", CERTIFICATE_ARN)
     else:
         logger.info("Importing new certificate to ACM")
-        response = acm_client.import_certificate(
-            Certificate=certificate_bytes,
-            PrivateKey=private_key_bytes,
-            CertificateChain=chain_bytes,
-        )
+
+    response = acm_client.import_certificate(**kwargs)  # type: ignore[arg-type]
 
     arn_value = response.get("CertificateArn")
     if not isinstance(arn_value, str):
         raise RuntimeError("ACM import response did not include a valid CertificateArn")
-    arn = arn_value
-    logger.info("ACM certificate ARN: %s", arn)
-    return arn
+    logger.info("ACM certificate ARN: %s", arn_value)
+    return arn_value
+
+
+# ---------------------------------------------------------------------------
+# Orchestration helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_acme_client(
+    account_key: jose.JWKRSA,
+) -> client.ClientV2:
+    """Build and register an ACME client with the configured directory."""
+    net = client.ClientNetwork(account_key, user_agent="acm-import-acme-automation/1.0")
+    directory_json = net.get(ACME_DIRECTORY_URL).json()
+    directory = messages.Directory.from_json(directory_json)
+    acme = client.ClientV2(directory, net)
+    _register_or_find_account(acme)
+    return acme
+
+
+def _create_order(
+    acme: client.ClientV2,
+    csr_pem: bytes,
+    acme_profile: str | None,
+) -> messages.OrderResource:
+    """Create a new ACME certificate order, optionally with a profile."""
+    if acme_profile is None:
+        order = acme.new_order(csr_pem)
+    else:
+        profiled = cast(AcmeClientWithProfile, acme)
+        order = profiled.new_order(csr_pem, profile=acme_profile)
+    logger.info("Created ACME order: %s", order.uri)
+    return order
+
+
+def _perform_http01_challenges(
+    acme: client.ClientV2,
+    order: messages.OrderResource,
+    account_key: jose.JWKRSA,
+) -> messages.OrderResource:
+    """Upload HTTP-01 tokens, verify reachability, answer challenges, and finalise."""
+    challenge_tokens: list[str] = []
+    try:
+        for auth in order.authorizations:
+            domain_name = auth.body.identifier.value
+            logger.info("Processing authorisation for: %s", domain_name)
+
+            http01_chall = None
+            for chall_body in auth.body.challenges:
+                if isinstance(chall_body.chall, challenges.HTTP01):
+                    http01_chall = chall_body
+                    break
+
+            if http01_chall is None:
+                raise RuntimeError(f"No HTTP-01 challenge found for {domain_name}")
+
+            if hasattr(http01_chall.chall, "encode"):
+                token_path = http01_chall.chall.encode("token")
+            else:
+                token_path = http01_chall.chall.encode_token()
+            key_auth = http01_chall.chall.key_authorization(account_key)
+
+            _upload_challenge_token(token_path, key_auth)
+            challenge_tokens.append(token_path)
+            _verify_http_challenge_reachability(token_path, key_auth)
+
+            acme.answer_challenge(
+                http01_chall, http01_chall.chall.response(account_key)
+            )
+            logger.info("Challenge answered for %s", domain_name)
+
+        logger.info("Finalising ACME order…")
+        return acme.poll_and_finalize(order)
+
+    finally:
+        for token_path in challenge_tokens:
+            _delete_challenge_token(token_path)
+
+
+def _process_issued_certificate(
+    order: messages.OrderResource,
+    cert_private_key: rsa.RSAPrivateKey,
+) -> str:
+    """Extract cert from finalised order, store in Secrets Manager, import to ACM.
+
+    Returns the ACM certificate ARN.
+    """
+    fullchain_pem = order.fullchain_pem
+    if not fullchain_pem:
+        raise RuntimeError("No certificate returned by ACME server")
+
+    pem_blocks = _split_pem(fullchain_pem)
+    certificate_pem = pem_blocks[0]
+    chain_pem = "".join(pem_blocks[1:]) if len(pem_blocks) > 1 else ""
+
+    private_key_pem = cert_private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+    _store_cert_in_secrets_manager(certificate_pem, private_key_pem, chain_pem)
+    return _import_to_acm(certificate_pem, private_key_pem, chain_pem)
+
+
+def _renew_certificate() -> str:
+    """Execute the full ACME certificate renewal workflow.
+
+    Returns the ACM certificate ARN.
+    """
+    account_key = _load_or_create_account_key()
+    acme = _build_acme_client(account_key)
+
+    acme_profile = _resolve_acme_profile(DOMAIN)
+    if acme_profile is not None:
+        logger.info("Using ACME profile '%s' for identifier '%s'", acme_profile, DOMAIN)
+
+    cert_private_key = _generate_cert_key()
+    csr_pem = _generate_csr(DOMAIN, cert_private_key)
+
+    order = _create_order(acme, csr_pem, acme_profile)
+    finalised_order = _perform_http01_challenges(acme, order, account_key)
+
+    return _process_issued_certificate(finalised_order, cert_private_key)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +466,10 @@ def _import_to_acm(
 # ---------------------------------------------------------------------------
 
 
-def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
+def lambda_handler(
+    event: dict[str, object],  # noqa: ARG001
+    context: object,  # noqa: ARG001
+) -> dict[str, object]:
     """Renew a TLS certificate via ACME and import it to ACM.
 
     Parameters
@@ -372,103 +490,7 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
     logger.info("Starting certificate renewal for domain: %s", DOMAIN)
 
     try:
-        # 1. Load (or create) the ACME account key
-        account_key = _load_or_create_account_key()
-
-        # 2. Build an ACME client
-        net = client.ClientNetwork(
-            account_key, user_agent="acm-import-acme-automation/1.0"
-        )
-        directory_json = net.get(ACME_DIRECTORY_URL).json()
-        directory = messages.Directory.from_json(directory_json)
-        acme_client = client.ClientV2(directory, net)
-
-        acme_profile = _resolve_acme_profile(DOMAIN)
-        if acme_profile is not None:
-            logger.info(
-                "Using ACME profile '%s' for identifier '%s'", acme_profile, DOMAIN
-            )
-
-        # 3. Register / find ACME account
-        _register_or_find_account(acme_client)
-
-        # 4. Generate certificate private key and CSR
-        cert_private_key = _generate_cert_key()
-        csr_pem = _generate_csr(DOMAIN, cert_private_key)
-
-        # 5. Create a new certificate order
-        if acme_profile is None:
-            order = acme_client.new_order(csr_pem)
-        else:
-            profiled_acme_client = cast(AcmeClientWithProfile, acme_client)
-            order = profiled_acme_client.new_order(csr_pem, profile=acme_profile)
-        logger.info("Created ACME order: %s", order.uri)
-
-        # 6. Handle HTTP-01 challenges
-        challenge_resources = []
-        try:
-            for auth in order.authorizations:
-                domain_name = auth.body.identifier.value
-                logger.info("Processing authorisation for: %s", domain_name)
-
-                http01_chall = None
-                for chall_body in auth.body.challenges:
-                    if isinstance(chall_body.chall, challenges.HTTP01):
-                        http01_chall = chall_body
-                        break
-
-                if http01_chall is None:
-                    raise RuntimeError(f"No HTTP-01 challenge found for {domain_name}")
-
-                if hasattr(http01_chall.chall, "encode"):
-                    token_path = http01_chall.chall.encode("token")
-                else:
-                    token_path = http01_chall.chall.encode_token()
-                key_auth = http01_chall.chall.key_authorization(account_key)
-                _upload_challenge_token(token_path, key_auth)
-                challenge_resources.append(token_path)
-
-                # Confirm that the challenge file is publicly reachable before notifying ACME.
-                _verify_http_challenge_reachability(token_path, key_auth)
-
-                # Notify Let's Encrypt the challenge is ready
-                acme_client.answer_challenge(
-                    http01_chall, http01_chall.chall.response(account_key)
-                )
-                logger.info("Challenge answered for %s", domain_name)
-
-            # 7. Finalise the order: poll authorisations then submit the CSR
-            logger.info("Finalising ACME order…")
-            order = acme_client.poll_and_finalize(order)
-
-        finally:
-            # Always clean up challenge tokens
-            for token_path in challenge_resources:
-                _delete_challenge_token(token_path)
-
-        # 8. Download the issued certificate
-        logger.info("Downloading issued certificate")
-        fullchain_pem_list = order.fullchain_pem
-        if not fullchain_pem_list:
-            raise RuntimeError("No certificate returned by ACME server")
-
-        # Split full-chain into leaf cert + chain
-        pem_blocks = _split_pem(fullchain_pem_list)
-        certificate_pem = pem_blocks[0]
-        chain_pem = "".join(pem_blocks[1:]) if len(pem_blocks) > 1 else ""
-
-        private_key_pem = cert_private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ).decode()
-
-        # 9. Store certificate in Secrets Manager
-        _store_cert_in_secrets_manager(certificate_pem, private_key_pem, chain_pem)
-
-        # 10. Import certificate to ACM
-        acm_arn = _import_to_acm(certificate_pem, private_key_pem, chain_pem)
-
+        acm_arn = _renew_certificate()
         logger.info("Certificate renewal completed successfully")
         return {
             "statusCode": 200,
@@ -480,7 +502,6 @@ def lambda_handler(event: dict, context: object) -> dict:  # noqa: ARG001
                 }
             ),
         }
-
     except Exception as exc:
         logger.exception("Certificate renewal failed: %s", exc)
         return {

@@ -7,20 +7,144 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
+import * as childProcess from 'node:child_process';
 import * as path from 'path';
+
+// -------------------------------------------------------------------------
+// Constants
+// -------------------------------------------------------------------------
+const VPC_CIDR = '10.0.0.0/16';
+const LAMBDA_SOURCE_PATH = path.join(__dirname, '../lambda/renew_certificate');
+
+// -------------------------------------------------------------------------
+// Helper: Find a working Python executable from known candidate paths
+// -------------------------------------------------------------------------
+function findPythonExecutable(cwd: string): string | undefined {
+  const candidates = [
+    process.env.PYTHON,
+    process.env.npm_config_python,
+    process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python3') : undefined,
+    process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python') : undefined,
+    path.join(process.cwd(), '.venv/bin/python3'),
+    path.join(process.cwd(), '.venv/bin/python'),
+    'python3',
+    'python',
+  ].filter((c): c is string => c !== undefined && c.length > 0);
+
+  return candidates.find((candidate) => {
+    const probe = childProcess.spawnSync(candidate, ['-c', 'import sys'], {
+      cwd,
+      stdio: 'ignore',
+    });
+    return probe.status === 0;
+  });
+}
+
+// -------------------------------------------------------------------------
+// Helper: Build Lambda code asset with ARM64 pip bundling
+// -------------------------------------------------------------------------
+function buildLambdaCode(sourcePath: string): lambda.Code {
+  const isJestRuntime = process.env.JEST_WORKER_ID !== undefined;
+  if (isJestRuntime) {
+    return lambda.Code.fromAsset(sourcePath);
+  }
+
+  return lambda.Code.fromAsset(sourcePath, {
+    bundling: {
+      local: {
+        tryBundle(outputDir: string): boolean {
+          const pythonExecutable = findPythonExecutable(sourcePath);
+          if (!pythonExecutable) {
+            return false;
+          }
+
+          const result = childProcess.spawnSync(
+            'bash',
+            [
+              '-c',
+              `set -euo pipefail && "${pythonExecutable}" -m pip install --no-cache-dir --upgrade pip && "${pythonExecutable}" -m pip install --no-cache-dir --target "${outputDir}" --platform manylinux2014_aarch64 --implementation cp --python-version 3.12 --only-binary=:all: -r requirements.txt && cp -au . "${outputDir}"`,
+            ],
+            { cwd: sourcePath, stdio: 'inherit' },
+          );
+          return result.status === 0;
+        },
+      },
+      // Dockerが使える環境では Lambda ARM64 ランタイムイメージでバンドルする。
+      // Dockerが使えない環境では local.tryBundle の ARM64 wheel バンドルを使う。
+      image: cdk.DockerImage.fromRegistry('public.ecr.aws/lambda/python:3.12-arm64'),
+      platform: lambda.Architecture.ARM_64.dockerPlatform,
+      command: [
+        'bash',
+        '-c',
+        'pip install --no-cache-dir -r requirements.txt -t /asset-output && cp -au . /asset-output',
+      ],
+    },
+  });
+}
+
+// -------------------------------------------------------------------------
+// Helper: Build EC2 UserData for nginx (plain HTTP + S3 proxy for ACME)
+// -------------------------------------------------------------------------
+function buildNginxUserData(region: string, challengeBucketName: string): ec2.UserData {
+  const userData = ec2.UserData.forLinux();
+  userData.addCommands(
+    '#!/bin/bash',
+    'set -euo pipefail',
+
+    // Install nginx
+    'dnf install -y nginx',
+
+    // Write nginx config
+    'cat > /etc/nginx/conf.d/acme.conf << \'NGINXEOF\'',
+    'server {',
+    '    listen 80;',
+    '    server_name _;',
+    '',
+    '    # Proxy ACME HTTP-01 challenge tokens to S3',
+    '    location /.well-known/acme-challenge/ {',
+    `        proxy_pass https://s3.${region}.amazonaws.com/\${CHALLENGE_BUCKET}/.well-known/acme-challenge/;`,
+    `        proxy_set_header Host s3.${region}.amazonaws.com;`,
+    '        proxy_ssl_server_name on;',
+    '        proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;',
+    '        proxy_ssl_verify on;',
+    '    }',
+    '',
+    '    location / {',
+    '        root   /usr/share/nginx/html;',
+    '        index  index.html index.htm;',
+    '    }',
+    '',
+    '    location = /healthz {',
+    '        add_header Content-Type text/plain;',
+    '        return 200 "ok";',
+    '    }',
+    '}',
+    'NGINXEOF',
+
+    // Substitute CHALLENGE_BUCKET placeholder in nginx config
+    `CHALLENGE_BUCKET_NAME="${challengeBucketName}"`,
+    'sed -i "s/\\${CHALLENGE_BUCKET}/$CHALLENGE_BUCKET_NAME/g" /etc/nginx/conf.d/acme.conf',
+
+    // Remove default server config to avoid conflicts
+    'rm -f /etc/nginx/conf.d/default.conf',
+
+    // Write a default index page to avoid missing-content issues
+    'echo "acm-import-acme-automation" > /usr/share/nginx/html/index.html',
+
+    // Validate nginx config before startup
+    'nginx -t',
+
+    // Enable and start nginx
+    'systemctl enable --now nginx',
+  );
+  return userData;
+}
 
 export class AcmImportAcmeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // -------------------------------------------------------------------------
-    // Stack Parameter: target domain / IP address for the certificate
-    // -------------------------------------------------------------------------
-    const domainParam = new cdk.CfnParameter(this, 'Domain', {
-      type: 'String',
-      description: 'Domain name or IP address to issue the TLS certificate for (e.g. 203.0.113.1)',
-      default: 'example.com',
-    });
+    const deploymentRegion = cdk.Stack.of(this).region;
 
     // -------------------------------------------------------------------------
     // Stack Parameter: ACM certificate ARN for the NLB TLS listener
@@ -34,6 +158,22 @@ export class AcmImportAcmeStack extends cdk.Stack {
       default: '',
     });
 
+    const acmeDomainSuffixParam = new cdk.CfnParameter(this, 'AcmeDomainSuffix', {
+      type: 'String',
+      description:
+        'Domain suffix for ACME validation FQDN. The issued domain becomes <NlbPublicIp>.<suffix>. ' +
+        'Use a dynamic DNS suffix such as nip.io. sslip.io may fail due to Let\'s Encrypt rate limits.',
+      default: 'nip.io',
+    });
+
+    const acmeDirectoryUrlParam = new cdk.CfnParameter(this, 'AcmeDirectoryUrl', {
+      type: 'String',
+      description:
+        'ACME directory URL. Default uses Let\'s Encrypt staging for validation environments. ' +
+        'Use production URL only for final issuance.',
+      default: 'https://acme-staging-v02.api.letsencrypt.org/directory',
+    });
+
     // Condition: only create the TLS listener when a certificate ARN is provided
     const hasCert = new cdk.CfnCondition(this, 'HasCertificate', {
       expression: cdk.Fn.conditionNot(
@@ -45,6 +185,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // VPC: single AZ, public subnet only (no NAT GW to save cost)
     // -------------------------------------------------------------------------
     const vpc = new ec2.Vpc(this, 'Vpc', {
+      ipAddresses: ec2.IpAddresses.cidr(VPC_CIDR),
       maxAzs: 1,
       natGateways: 0,
       subnetConfiguration: [
@@ -70,6 +211,15 @@ export class AcmImportAcmeStack extends cdk.Stack {
     ]);
 
     // -------------------------------------------------------------------------
+    // Elastic IP for the NLB
+    // -------------------------------------------------------------------------
+    const nlbEip = new ec2.CfnEIP(this, 'NlbEip', {
+      domain: 'vpc',
+    });
+
+    const nlbAcmeFqdn = cdk.Fn.join('', [nlbEip.ref, '.', acmeDomainSuffixParam.valueAsString]);
+
+    // -------------------------------------------------------------------------
     // S3 Bucket: ACME HTTP-01 challenge tokens
     // -------------------------------------------------------------------------
     const accessLogsBucket = new s3.Bucket(this, 'ChallengeAccessLogsBucket', {
@@ -88,7 +238,12 @@ export class AcmImportAcmeStack extends cdk.Stack {
     ]);
 
     const challengeBucket = new s3.Bucket(this, 'ChallengeBucket', {
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      blockPublicAccess: new s3.BlockPublicAccess({
+        blockPublicAcls: true,
+        ignorePublicAcls: true,
+        blockPublicPolicy: false,
+        restrictPublicBuckets: false,
+      }),
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
       versioned: false,
@@ -101,9 +256,17 @@ export class AcmImportAcmeStack extends cdk.Stack {
     NagSuppressions.addResourceSuppressions(challengeBucket, [
       {
         id: 'AwsSolutions-S2',
-        reason: 'Public access is intentionally blocked; nginx proxies .well-known/acme-challenge/ to S3 via IAM',
+        reason: 'Only .well-known/acme-challenge/ objects are intentionally world-readable for ACME HTTP-01 validation',
       },
     ]);
+
+    challengeBucket.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'AllowAnonymousReadForAcmeChallengePrefix',
+      effect: iam.Effect.ALLOW,
+      principals: [new iam.AnyPrincipal()],
+      actions: ['s3:GetObject'],
+      resources: [challengeBucket.arnForObjects('.well-known/acme-challenge/*')],
+    }));
 
     // -------------------------------------------------------------------------
     // Secrets Manager: ACME account private key
@@ -116,6 +279,13 @@ export class AcmImportAcmeStack extends cdk.Stack {
       },
     });
 
+    NagSuppressions.addResourceSuppressions(acmeAccountSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason: 'This secret stores an ACME account key and is updated by application workflow, not by native Secrets Manager rotation integration',
+      },
+    ]);
+
     // -------------------------------------------------------------------------
     // Secrets Manager: TLS certificate data (cert + key + chain)
     // -------------------------------------------------------------------------
@@ -126,6 +296,13 @@ export class AcmImportAcmeStack extends cdk.Stack {
         generateStringKey: '_unused',
       },
     });
+
+    NagSuppressions.addResourceSuppressions(certSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason: 'This secret stores certificate artifacts that are rotated by the ACME renewal Lambda, not by native Secrets Manager rotation',
+      },
+    ]);
 
     // -------------------------------------------------------------------------
     // IAM Role for Lambda
@@ -185,22 +362,23 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // -------------------------------------------------------------------------
     // Lambda: Certificate Renewal
     // -------------------------------------------------------------------------
+
     const renewCertLambda = new lambda.Function(this, 'RenewCertLambda', {
       runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'handler.lambda_handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/renew_certificate')),
+      code: buildLambdaCode(LAMBDA_SOURCE_PATH),
       role: lambdaRole,
       timeout: cdk.Duration.minutes(5),
       memorySize: 256,
       description: 'Renews TLS certificates via ACME (Let\'s Encrypt) and imports them to ACM',
       environment: {
-        ACME_DIRECTORY_URL: 'https://acme-v02.api.letsencrypt.org/directory',
+        ACME_DIRECTORY_URL: acmeDirectoryUrlParam.valueAsString,
         ACME_ACCOUNT_SECRET_ARN: acmeAccountSecret.secretArn,
         CERT_SECRET_ARN: certSecret.secretArn,
         CHALLENGE_BUCKET: challengeBucket.bucketName,
-        DOMAIN: domainParam.valueAsString,
+        DOMAIN: nlbAcmeFqdn,
         CERTIFICATE_ARN: certArnParam.valueAsString,
-        AWS_DEFAULT_REGION: 'ap-northeast-1',
       },
     });
 
@@ -223,20 +401,28 @@ export class AcmImportAcmeStack extends cdk.Stack {
     );
 
     // -------------------------------------------------------------------------
-    // Security Group for EC2 (HTTP from VPC only; TLS is terminated at the NLB)
+    // Security Group for EC2 (HTTP from Internet; TLS is terminated at the NLB)
     // -------------------------------------------------------------------------
     const webServerSg = new ec2.SecurityGroup(this, 'WebServerSg', {
       vpc,
-      description: 'Security group for the ACME web server (HTTP from VPC only; TLS terminated at NLB)',
+      description: 'Security group for the ACME web server (HTTP from internet via NLB; TLS terminated at NLB)',
       allowAllOutbound: true,
     });
 
-    // Allow HTTP from within the VPC (NLB-to-EC2 traffic and NLB health checks)
+    // Allow HTTP from internet clients via NLB.
+    // NLB preserves source IP, so instance SG must allow client source addresses.
     webServerSg.addIngressRule(
-      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Peer.anyIpv4(),
       ec2.Port.tcp(80),
-      'Allow HTTP from VPC (NLB to EC2)',
+      'Allow HTTP from internet clients via NLB (source IP preserved)',
     );
+
+    NagSuppressions.addResourceSuppressions(webServerSg, [
+      {
+        id: 'AwsSolutions-EC23',
+        reason: 'NLB preserves client source IP for instance targets; EC2 SG must allow HTTP/80 from internet to receive traffic via NLB for ACME HTTP-01',
+      },
+    ]);
 
     // -------------------------------------------------------------------------
     // IAM Role for EC2
@@ -273,46 +459,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // -------------------------------------------------------------------------
     // EC2 User Data (nginx serves plain HTTP; TLS is terminated at the NLB)
     // -------------------------------------------------------------------------
-    const userData = ec2.UserData.forLinux();
-    userData.addCommands(
-      '#!/bin/bash',
-      'set -euo pipefail',
-
-      // Install nginx
-      'dnf update -y',
-      'dnf install -y nginx',
-
-      // Write nginx config
-      'cat > /etc/nginx/conf.d/acme.conf << \'NGINXEOF\'',
-      'server {',
-      '    listen 80;',
-      '    server_name _;',
-      '',
-      '    # Proxy ACME HTTP-01 challenge tokens to S3',
-      '    location /.well-known/acme-challenge/ {',
-      '        proxy_pass https://s3.ap-northeast-1.amazonaws.com/${CHALLENGE_BUCKET}/.well-known/acme-challenge/;',
-      '        proxy_set_header Host s3.ap-northeast-1.amazonaws.com;',
-      '        proxy_ssl_verify on;',
-      '    }',
-      '',
-      '    location / {',
-      '        root   /usr/share/nginx/html;',
-      '        index  index.html index.htm;',
-      '    }',
-      '}',
-      'NGINXEOF',
-
-      // Substitute CHALLENGE_BUCKET placeholder in nginx config
-      `CHALLENGE_BUCKET_NAME="${challengeBucket.bucketName}"`,
-      'sed -i "s/\\${CHALLENGE_BUCKET}/$CHALLENGE_BUCKET_NAME/g" /etc/nginx/conf.d/acme.conf',
-
-      // Remove default server config to avoid conflicts
-      'rm -f /etc/nginx/conf.d/default.conf',
-
-      // Enable and start nginx
-      'systemctl enable nginx',
-      'systemctl start nginx',
-    );
+    const userData = buildNginxUserData(deploymentRegion, challengeBucket.bucketName);
 
     // -------------------------------------------------------------------------
     // EC2 Instance: t4g.nano, ARM64, Amazon Linux 2023
@@ -351,13 +498,6 @@ export class AcmImportAcmeStack extends cdk.Stack {
     ]);
 
     // -------------------------------------------------------------------------
-    // Elastic IP for the NLB (static IP used as the subject for the certificate)
-    // -------------------------------------------------------------------------
-    const nlbEip = new ec2.CfnEIP(this, 'NlbEip', {
-      domain: 'vpc',
-    });
-
-    // -------------------------------------------------------------------------
     // Network Load Balancer (TLS terminated here; forwards plain HTTP to EC2)
     // Use CfnLoadBalancer (L1) to assign the EIP via SubnetMappings.
     // -------------------------------------------------------------------------
@@ -391,7 +531,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
       targetType: 'instance',
       targets: [{ id: instance.instanceId }],
       healthCheckProtocol: 'HTTP',
-      healthCheckPath: '/',
+      healthCheckPath: '/healthz',
       healthCheckPort: '80',
     });
 
@@ -435,6 +575,11 @@ export class AcmImportAcmeStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'NlbDnsName', {
       value: cfnNlb.attrDnsName,
       description: 'DNS name of the Network Load Balancer',
+    });
+
+    new cdk.CfnOutput(this, 'NlbAcmeFqdn', {
+      value: nlbAcmeFqdn,
+      description: 'ACME FQDN derived from NLB Elastic IP and AcmeDomainSuffix (used for HTTP-01)',
     });
 
     new cdk.CfnOutput(this, 'ChallengeBucketName', {

@@ -10,12 +10,141 @@ import { Construct } from 'constructs';
 import * as childProcess from 'node:child_process';
 import * as path from 'path';
 
+// -------------------------------------------------------------------------
+// Constants
+// -------------------------------------------------------------------------
+const VPC_CIDR = '10.0.0.0/16';
+const LAMBDA_SOURCE_PATH = path.join(__dirname, '../lambda/renew_certificate');
+
+// -------------------------------------------------------------------------
+// Helper: Find a working Python executable from known candidate paths
+// -------------------------------------------------------------------------
+function findPythonExecutable(cwd: string): string | undefined {
+  const candidates = [
+    process.env.PYTHON,
+    process.env.npm_config_python,
+    process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python3') : undefined,
+    process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python') : undefined,
+    path.join(process.cwd(), '.venv/bin/python3'),
+    path.join(process.cwd(), '.venv/bin/python'),
+    'python3',
+    'python',
+  ].filter((c): c is string => c !== undefined && c.length > 0);
+
+  return candidates.find((candidate) => {
+    const probe = childProcess.spawnSync(candidate, ['-c', 'import sys'], {
+      cwd,
+      stdio: 'ignore',
+    });
+    return probe.status === 0;
+  });
+}
+
+// -------------------------------------------------------------------------
+// Helper: Build Lambda code asset with ARM64 pip bundling
+// -------------------------------------------------------------------------
+function buildLambdaCode(sourcePath: string): lambda.Code {
+  const isJestRuntime = process.env.JEST_WORKER_ID !== undefined;
+  if (isJestRuntime) {
+    return lambda.Code.fromAsset(sourcePath);
+  }
+
+  return lambda.Code.fromAsset(sourcePath, {
+    bundling: {
+      local: {
+        tryBundle(outputDir: string): boolean {
+          const pythonExecutable = findPythonExecutable(sourcePath);
+          if (!pythonExecutable) {
+            return false;
+          }
+
+          const result = childProcess.spawnSync(
+            'bash',
+            [
+              '-c',
+              `set -euo pipefail && "${pythonExecutable}" -m pip install --no-cache-dir --upgrade pip && "${pythonExecutable}" -m pip install --no-cache-dir --target "${outputDir}" --platform manylinux2014_aarch64 --implementation cp --python-version 3.12 --only-binary=:all: -r requirements.txt && cp -au . "${outputDir}"`,
+            ],
+            { cwd: sourcePath, stdio: 'inherit' },
+          );
+          return result.status === 0;
+        },
+      },
+      // Dockerが使える環境では Lambda ARM64 ランタイムイメージでバンドルする。
+      // Dockerが使えない環境では local.tryBundle の ARM64 wheel バンドルを使う。
+      image: cdk.DockerImage.fromRegistry('public.ecr.aws/lambda/python:3.12-arm64'),
+      platform: lambda.Architecture.ARM_64.dockerPlatform,
+      command: [
+        'bash',
+        '-c',
+        'pip install --no-cache-dir -r requirements.txt -t /asset-output && cp -au . /asset-output',
+      ],
+    },
+  });
+}
+
+// -------------------------------------------------------------------------
+// Helper: Build EC2 UserData for nginx (plain HTTP + S3 proxy for ACME)
+// -------------------------------------------------------------------------
+function buildNginxUserData(region: string, challengeBucketName: string): ec2.UserData {
+  const userData = ec2.UserData.forLinux();
+  userData.addCommands(
+    '#!/bin/bash',
+    'set -euo pipefail',
+
+    // Install nginx
+    'dnf install -y nginx',
+
+    // Write nginx config
+    'cat > /etc/nginx/conf.d/acme.conf << \'NGINXEOF\'',
+    'server {',
+    '    listen 80;',
+    '    server_name _;',
+    '',
+    '    # Proxy ACME HTTP-01 challenge tokens to S3',
+    '    location /.well-known/acme-challenge/ {',
+    `        proxy_pass https://s3.${region}.amazonaws.com/\${CHALLENGE_BUCKET}/.well-known/acme-challenge/;`,
+    `        proxy_set_header Host s3.${region}.amazonaws.com;`,
+    '        proxy_ssl_server_name on;',
+    '        proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;',
+    '        proxy_ssl_verify on;',
+    '    }',
+    '',
+    '    location / {',
+    '        root   /usr/share/nginx/html;',
+    '        index  index.html index.htm;',
+    '    }',
+    '',
+    '    location = /healthz {',
+    '        add_header Content-Type text/plain;',
+    '        return 200 "ok";',
+    '    }',
+    '}',
+    'NGINXEOF',
+
+    // Substitute CHALLENGE_BUCKET placeholder in nginx config
+    `CHALLENGE_BUCKET_NAME="${challengeBucketName}"`,
+    'sed -i "s/\\${CHALLENGE_BUCKET}/$CHALLENGE_BUCKET_NAME/g" /etc/nginx/conf.d/acme.conf',
+
+    // Remove default server config to avoid conflicts
+    'rm -f /etc/nginx/conf.d/default.conf',
+
+    // Write a default index page to avoid missing-content issues
+    'echo "acm-import-acme-automation" > /usr/share/nginx/html/index.html',
+
+    // Validate nginx config before startup
+    'nginx -t',
+
+    // Enable and start nginx
+    'systemctl enable --now nginx',
+  );
+  return userData;
+}
+
 export class AcmImportAcmeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
     const deploymentRegion = cdk.Stack.of(this).region;
-    const vpcCidr = '10.0.0.0/16';
 
     // -------------------------------------------------------------------------
     // Stack Parameter: ACM certificate ARN for the NLB TLS listener
@@ -56,7 +185,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // VPC: single AZ, public subnet only (no NAT GW to save cost)
     // -------------------------------------------------------------------------
     const vpc = new ec2.Vpc(this, 'Vpc', {
-      ipAddresses: ec2.IpAddresses.cidr(vpcCidr),
+      ipAddresses: ec2.IpAddresses.cidr(VPC_CIDR),
       maxAzs: 1,
       natGateways: 0,
       subnetConfiguration: [
@@ -233,70 +362,12 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // -------------------------------------------------------------------------
     // Lambda: Certificate Renewal
     // -------------------------------------------------------------------------
-    const renewCertLambdaSourcePath = path.join(__dirname, '../lambda/renew_certificate');
-    const isJestRuntime = process.env.JEST_WORKER_ID !== undefined;
-    const renewCertLambdaCode = isJestRuntime
-      ? lambda.Code.fromAsset(renewCertLambdaSourcePath)
-      : lambda.Code.fromAsset(renewCertLambdaSourcePath, {
-        bundling: {
-          local: {
-            tryBundle(outputDir: string): boolean {
-              const pythonCandidates = [
-                process.env.PYTHON,
-                process.env.npm_config_python,
-                process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python3') : undefined,
-                process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python') : undefined,
-                path.join(process.cwd(), '.venv/bin/python3'),
-                path.join(process.cwd(), '.venv/bin/python'),
-                'python3',
-                'python',
-              ].filter((candidate): candidate is string => candidate !== undefined && candidate.length > 0);
-
-              const pythonExecutable = pythonCandidates.find((candidate) => {
-                const probe = childProcess.spawnSync(candidate, ['-c', 'import sys'], {
-                  cwd: renewCertLambdaSourcePath,
-                  stdio: 'ignore',
-                });
-
-                return probe.status === 0;
-              });
-
-              if (!pythonExecutable) {
-                return false;
-              }
-
-              const localBundling = childProcess.spawnSync(
-                'bash',
-                [
-                  '-c',
-                  `set -euo pipefail && "${pythonExecutable}" -m pip install --no-cache-dir --upgrade pip && "${pythonExecutable}" -m pip install --no-cache-dir --target "${outputDir}" --platform manylinux2014_aarch64 --implementation cp --python-version 3.12 --only-binary=:all: -r requirements.txt && cp -au . "${outputDir}"`,
-                ],
-                {
-                  cwd: renewCertLambdaSourcePath,
-                  stdio: 'inherit',
-                },
-              );
-
-              return localBundling.status === 0;
-            },
-          },
-          // Dockerが使える環境では Lambda ARM64 ランタイムイメージでバンドルする。
-          // Dockerが使えない環境では local.tryBundle の ARM64 wheel バンドルを使う。
-          image: cdk.DockerImage.fromRegistry('public.ecr.aws/lambda/python:3.12-arm64'),
-          platform: lambda.Architecture.ARM_64.dockerPlatform,
-          command: [
-            'bash',
-            '-c',
-            'pip install --no-cache-dir -r requirements.txt -t /asset-output && cp -au . /asset-output',
-          ],
-        },
-      });
 
     const renewCertLambda = new lambda.Function(this, 'RenewCertLambda', {
       runtime: lambda.Runtime.PYTHON_3_12,
       architecture: lambda.Architecture.ARM_64,
       handler: 'handler.lambda_handler',
-      code: renewCertLambdaCode,
+      code: buildLambdaCode(LAMBDA_SOURCE_PATH),
       role: lambdaRole,
       timeout: cdk.Duration.minutes(5),
       memorySize: 256,
@@ -388,57 +459,7 @@ export class AcmImportAcmeStack extends cdk.Stack {
     // -------------------------------------------------------------------------
     // EC2 User Data (nginx serves plain HTTP; TLS is terminated at the NLB)
     // -------------------------------------------------------------------------
-    const userData = ec2.UserData.forLinux();
-    userData.addCommands(
-      '#!/bin/bash',
-      'set -euo pipefail',
-
-      // Install nginx
-      'dnf install -y nginx',
-
-      // Write nginx config
-      'cat > /etc/nginx/conf.d/acme.conf << \'NGINXEOF\'',
-      'server {',
-      '    listen 80;',
-      '    server_name _;',
-      '',
-      '    # Proxy ACME HTTP-01 challenge tokens to S3',
-      '    location /.well-known/acme-challenge/ {',
-      `        proxy_pass https://s3.${deploymentRegion}.amazonaws.com/\${CHALLENGE_BUCKET}/.well-known/acme-challenge/;`,
-      `        proxy_set_header Host s3.${deploymentRegion}.amazonaws.com;`,
-      '        proxy_ssl_server_name on;',
-      '        proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;',
-      '        proxy_ssl_verify on;',
-      '    }',
-      '',
-      '    location / {',
-      '        root   /usr/share/nginx/html;',
-      '        index  index.html index.htm;',
-      '    }',
-      '',
-      '    location = /healthz {',
-      '        add_header Content-Type text/plain;',
-      '        return 200 "ok";',
-      '    }',
-      '}',
-      'NGINXEOF',
-
-      // Substitute CHALLENGE_BUCKET placeholder in nginx config
-      `CHALLENGE_BUCKET_NAME="${challengeBucket.bucketName}"`,
-      'sed -i "s/\\${CHALLENGE_BUCKET}/$CHALLENGE_BUCKET_NAME/g" /etc/nginx/conf.d/acme.conf',
-
-      // Remove default server config to avoid conflicts
-      'rm -f /etc/nginx/conf.d/default.conf',
-
-      // Write a default index page to avoid missing-content issues
-      'echo "acm-import-acme-automation" > /usr/share/nginx/html/index.html',
-
-      // Validate nginx config before startup
-      'nginx -t',
-
-      // Enable and start nginx
-      'systemctl enable --now nginx',
-    );
+    const userData = buildNginxUserData(deploymentRegion, challengeBucket.bucketName);
 
     // -------------------------------------------------------------------------
     // EC2 Instance: t4g.nano, ARM64, Amazon Linux 2023

@@ -59,8 +59,7 @@ npm run build
 
 ```bash
 npx cdk synth
-npx cdk deploy --require-approval never \
-  --parameters AcmeDomainSuffix=nip.io
+npx cdk deploy --require-approval never
 ```
 
 デプロイ後、CloudFormation 出力 `NlbAcmeFqdn` が証明書対象FQDNです。
@@ -82,33 +81,12 @@ aws lambda invoke \
   --payload '{}' \
   response.json
 
-cat response.json
+jq -r '.body | fromjson' response.json
 ```
-
-`Timeout during connect (likely firewall problem)` が出る場合は、まず第1回デプロイを再実施して
-Security Group / user-data の最新設定を反映し、以下で HTTP 到達性を確認してください。
-
-```bash
-NLB_PUBLIC_IP=$(aws cloudformation describe-stacks \
-  --stack-name AcmImportAcmeStack \
-  --region ap-northeast-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='NlbPublicIp'].OutputValue" \
-  --output text)
-
-CHALLENGE_BUCKET=$(aws cloudformation describe-stacks \
-  --stack-name AcmImportAcmeStack \
-  --region ap-northeast-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='ChallengeBucketName'].OutputValue" \
-  --output text)
-
-TOKEN="preflight-$(date +%s)"
-aws s3 cp <(printf 'ok') "s3://${CHALLENGE_BUCKET}/.well-known/acme-challenge/${TOKEN}" --region ap-northeast-1
-curl -sS -D - "http://${NLB_PUBLIC_IP}.nip.io/.well-known/acme-challenge/${TOKEN}"
-```
-
-`HTTP/1.1 200` と本文 `ok` が返る状態であれば、HTTP-01 の前提を満たしています。
 
 実行結果の `certificateArn` フィールドに ACM 証明書の ARN が記録されます。次のデプロイで使用します。
+
+> `Timeout during connect` が出る場合は、[トラブルシュート](#トラブルシュート)を参照してください。
 
 ### 第2回デプロイ（NLB TLSリスナー有効化）
 
@@ -117,8 +95,20 @@ curl -sS -D - "http://${NLB_PUBLIC_IP}.nip.io/.well-known/acme-challenge/${TOKEN
 
 ```bash
 npx cdk deploy --require-approval never \
-  --parameters AcmeDomainSuffix=nip.io \
   --parameters CertificateArn=$(jq -r '.body | fromjson | .certificateArn' response.json)
+```
+
+## 証明書の更新
+
+証明書の有効期限が近づいたら、Lambda を手動実行することで更新できます。
+`CERTIFICATE_ARN` が設定されていれば既存のACM証明書が上書き更新され、NLBへの再設定は不要です。
+
+```bash
+aws lambda invoke \
+  --function-name <Lambda関数名> \
+  --region ap-northeast-1 \
+  --payload '{}' \
+  response.json
 ```
 
 ## staging / production の切替
@@ -131,6 +121,10 @@ npx cdk deploy --require-approval never \
 https://acme-staging-v02.api.letsencrypt.org/directory
 ```
 
+Let's Encrypt のレート制限を避けるため、初回はステージング環境で動作確認することを推奨します。
+
+> staging証明書はブラウザに信頼されません。動作確認用途として使用してください。
+
 ### production へ切替する場合
 
 本番証明書を発行する場合のみ、`AcmeDirectoryUrl` を production URL に変更してデプロイします。
@@ -141,8 +135,6 @@ npx cdk deploy --require-approval never \
   --parameters AcmeDirectoryUrl=https://acme-v02.api.letsencrypt.org/directory
 ```
 
-> staging証明書はブラウザに信頼されません。動作確認用途として使用してください。
-
 ## Lambda環境変数
 
 Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタック定義から自動的に設定されます。  
@@ -150,26 +142,12 @@ Lambda関数 (`RenewCertLambda`) の環境変数はCDKスタック定義から�
 
 | 環境変数 | 設定方法 | 説明 |
 |---|---|---|
-| `ACME_DIRECTORY_URL` | CDK固定値 | Let's Encrypt ACME URL |
+| `ACME_DIRECTORY_URL` | CDKパラメータ | Let's Encrypt ACME URL |
 | `ACME_ACCOUNT_SECRET_ARN` | CDK自動設定 | ACMEアカウント秘密鍵シークレットARN |
 | `CERT_SECRET_ARN` | CDK自動設定 | 証明書データシークレットARN |
 | `CHALLENGE_BUCKET` | CDK自動設定 | HTTP-01 トークン保存S3バケット |
 | `DOMAIN` | CDK自動設定 | `<NlbPublicIp>.<AcmeDomainSuffix>` |
-| `CERTIFICATE_ARN` | パラメータ | 再インポート時に既存証明書ARNを指定 |
-
-### ステージング環境でのテスト
-
-Let's Encrypt のレート制限を避けるため、初回はステージング環境で動作確認することを推奨します。  
-`ACME_DIRECTORY_URL` を以下のように変更してください。
-
-```bash
-aws lambda update-function-configuration \
-  --function-name <Lambda関数名> \
-  --region ap-northeast-1 \
-  --environment "Variables={ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory,...}"
-```
-
-> ステージング証明書はブラウザに信頼されません。動作確認後は本番URLに戻してください。
+| `CERTIFICATE_ARN` | CDKパラメータ | 再インポート時に既存証明書ARNを指定 |
 
 ## トラブルシュート
 
@@ -183,39 +161,6 @@ Let's Encrypt の登録ドメイン単位レート制限です。
 - 本番運用時は独自ドメインを使用
 
 ### NLB ヘルスチェックが `unhealthy`
-
-- EC2 で `nginx` が起動しているか確認
-- `http://127.0.0.1/healthz` が `200` を返すか確認
-- EC2 Security Group が `tcp/80` を受信可能か確認（NLBは送信元IPを保持）
-
-## 検証コマンド
-
-```bash
-npm run build
-npm run lint
-npm test
-npx cdk synth
-```
-
-## 証明書の更新
-
-証明書の有効期限が近づいたら、Lambda を手動実行することで更新できます。  
-`CERTIFICATE_ARN` が設定されていれば既存のACM証明書が上書き更新され、NLBへの再設定は不要です。
-
-```bash
-aws lambda invoke \
-  --function-name <Lambda関数名> \
-  --region ap-northeast-1 \
-  --payload '{}' \
-  response.json
-```
-
-## 費用を抑えるための補足
-
-- 現状の `t4g.nano + single-AZ + NATなし` は、要件を満たしつつ安価な構成です。
-- さらに抑える場合は、検証後にスタックを削除して従量課金を止める運用が有効です。
-
-## トラブルシュート（NLBヘルスチェックがunhealthyになる場合）
 
 第1回デプロイ後にターゲットが `unhealthy` の場合は、以下を確認してください。
 
@@ -244,7 +189,7 @@ curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1/healthz
 
 `200` が返ればヘルスチェックパスは正常です。
 
-3. **Lambda実行で `No module named '_cffi_backend'` が出る場合**
+### Lambda実行で `No module named '_cffi_backend'` が出る場合
 
 Lambdaの依存ライブラリにネイティブ拡張 (`cryptography` / `cffi`) が含まれるため、
 ローカル環境で作成した成果物を使うと Lambda 実行環境 (ARM64) と不整合になることがあります。
@@ -259,7 +204,7 @@ npx cdk deploy
 
 再デプロイ後に再度 Lambda を手動実行し、`FunctionError` が出ないことを確認してください。
 
-4. **ACME HTTP-01 が `Timeout during connect` / `403 AccessDenied` になる場合**
+### ACME HTTP-01 が `Timeout during connect` / `403 AccessDenied` になる場合
 
 IP証明書の検証で `/.well-known/acme-challenge/*` が失敗する場合、以下を順に確認してください。
 
@@ -282,11 +227,38 @@ IP証明書の検証で `/.well-known/acme-challenge/*` が失敗する場合、
   - バケット全体ではなく、`/.well-known/acme-challenge/*` のみ `s3:GetObject` を許可してください。
   - 未設定だと `403 AccessDenied` になります。
 
-確認コマンド例:
+HTTP到達性の確認コマンド:
 
 ```bash
-curl -sS -D - http://<NlbPublicIp>/healthz
-curl -sS -D - http://<NlbPublicIp>/.well-known/acme-challenge/<token>
+NLB_PUBLIC_IP=$(aws cloudformation describe-stacks \
+  --stack-name AcmImportAcmeStack \
+  --region ap-northeast-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='NlbPublicIp'].OutputValue" \
+  --output text)
+
+CHALLENGE_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name AcmImportAcmeStack \
+  --region ap-northeast-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='ChallengeBucketName'].OutputValue" \
+  --output text)
+
+TOKEN="preflight-$(date +%s)"
+aws s3 cp <(printf 'ok') "s3://${CHALLENGE_BUCKET}/.well-known/acme-challenge/${TOKEN}" --region ap-northeast-1
+curl -sS -D - "http://${NLB_PUBLIC_IP}.nip.io/.well-known/acme-challenge/${TOKEN}"
 ```
 
-`/healthz` が `200`、challengeパスが `200` でトークン本文を返せる状態になれば、HTTP-01の前提は満たせます。
+`HTTP/1.1 200` と本文 `ok` が返る状態であれば、HTTP-01 の前提を満たしています。
+
+## 検証コマンド
+
+```bash
+npm run build
+npm run lint
+npm test
+npx cdk synth
+```
+
+## 費用を抑えるための補足
+
+- 現状の `t4g.nano + single-AZ + NATなし` は、要件を満たしつつ安価な構成です。
+- さらに抑える場合は、検証後にスタックを削除して従量課金を止める運用が有効です。

@@ -26,7 +26,6 @@ echo ""
 echo "*** Lambda invocation response ***"
 jq -r '.body | fromjson' /tmp/response.json
 echo ""
-echo ""
 
 sleep 240
 
